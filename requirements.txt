@@ -1,7 +1,9 @@
-# Phase 1 needs PyQt6 for the master password dialog and cryptography for the vault.
-# Other deps (requests, pywinauto, psutil) come in later phases.
+# Phase 1: PyQt6 for the master password dialog, cryptography for the vault.
+# Phase 3: requests for talking to the Riot API.
+# Phase 4 will add pywinauto + psutil.
 PyQt6>=6.6
 cryptography>=42
+requests>=2.31
 
 # Test runner
 pytest>=8.0
