@@ -24,11 +24,7 @@ import sys
 
 from PyQt6.QtWidgets import (
     QApplication,
-    QLabel,
-    QMainWindow,
     QMessageBox,
-    QVBoxLayout,
-    QWidget,
 )
 
 from src.logging_setup import setup as setup_logging
@@ -39,31 +35,10 @@ from src.storage.vault import (
     VaultNotFound,
     default_vault_path,
 )
+from src.ui.main_window import MainWindow
 from src.ui.master_password import prompt_set_password, prompt_unlock
 
 log = logging.getLogger(__name__)
-
-
-# ---------- placeholder window for Phase 1 ----------
-
-class Phase1PlaceholderWindow(QMainWindow):
-    # Throwaway window so we can see the unlock worked. Phase 2 replaces this
-    # with the real MainWindow that holds the account cards.
-
-    def __init__(self, vault: Vault):
-        super().__init__()
-        self.setWindowTitle("Riot Account Switcher (Phase 1)")
-        self.resize(480, 240)
-
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.addWidget(QLabel("Vault unlocked."))
-        layout.addWidget(QLabel(f"Path: {vault.path}"))
-        layout.addWidget(QLabel(f"Accounts: {len(vault.accounts)}"))
-        layout.addWidget(QLabel(
-            "Phase 2 will add the account grid and Add/Edit dialogs here."
-        ))
-        self.setCentralWidget(central)
 
 
 # ---------- main flow ----------
@@ -156,9 +131,26 @@ def main() -> int:
         )
         return 0
 
-    window = Phase1PlaceholderWindow(vault)
-    window.show()
-    return app.exec()
+    # Lock loop: when the user clicks the toolbar Lock button, the window
+    # closes with `was_locked = True`. We then re-prompt for the master
+    # password and re-open the window. If the user cancels the unlock,
+    # we exit cleanly.
+    while True:
+        window = MainWindow(vault)
+        window.show()
+        app.exec()
+
+        if not window.was_locked:
+            # Window closed via the X button -> normal exit.
+            log.info("main window closed, exiting")
+            return 0
+
+        log.info("vault locked, reprompting unlock")
+        vault.lock()
+        vault = acquire_vault(app)
+        if vault is None:
+            log.info("user cancelled unlock after lock — exiting")
+            return 0
 
 
 if __name__ == "__main__":
