@@ -1,0 +1,75 @@
+# Build the portable Windows .exe in CI.
+#
+# Triggers:
+#   - Push of any tag starting with `v` (v0.4-switch, v1.0, etc.)
+#       -> build, then attach the .exe to a GitHub Release for that tag.
+#   - Push to master and any pull request
+#       -> build only (no release). Lets us catch a broken build before tagging.
+#   - Manual trigger via the Actions tab ("Run workflow")
+#       -> build, no release attachment. Useful for testing branches.
+
+name: build-windows-exe
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write  # needed to attach files to releases on tag pushes
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install runtime + build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Run unit tests (sanity check before bundling)
+        run: pytest tests/ -q
+
+      - name: Build single-file .exe
+        run: pyinstaller RiotAccountSwitcher.spec --noconfirm --clean
+
+      - name: Verify .exe was produced
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/RiotAccountSwitcher.exe")) {
+            Write-Error "dist/RiotAccountSwitcher.exe was not produced"
+            exit 1
+          }
+          $size = [math]::Round((Get-Item "dist/RiotAccountSwitcher.exe").Length / 1MB, 1)
+          Write-Host "Built: dist/RiotAccountSwitcher.exe ($size MB)"
+
+      # Always upload as an Actions artifact so any branch/PR build is downloadable
+      # from the run page for ~90 days.
+      - name: Upload .exe as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RiotAccountSwitcher-${{ github.sha }}
+          path: dist/RiotAccountSwitcher.exe
+          retention-days: 90
+
+      # On tag pushes, also publish a GitHub Release with the .exe attached so
+      # friends can download it from the Releases page.
+      - name: Publish GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/RiotAccountSwitcher.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true

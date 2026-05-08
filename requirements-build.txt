@@ -1,0 +1,4 @@
+# Build-time only. Not needed to run the app.
+# Install alongside the runtime requirements when producing the .exe:
+#   uv pip install -r requirements.txt -r requirements-build.txt --python .venv\Scripts\python.exe
+pyinstaller>=6.10

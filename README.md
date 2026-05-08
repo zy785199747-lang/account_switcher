@@ -22,9 +22,17 @@ A Windows desktop app that stores multiple Riot Games accounts encrypted, shows 
 
 ## Installation
 
-You have two options. **uv** is faster and handles Python install for you; `pip` is fine if you already have Python.
+Three options, easiest first.
 
-### Option 1 — uv (recommended)
+### Option 0 — Pre-built .exe (no Python needed)
+
+Grab the latest `RiotAccountSwitcher.exe` from the [Releases page](https://github.com/zy785199747-lang/account_switcher/releases). Double-click to run. ~46 MB single file, portable, no install required.
+
+> Windows SmartScreen will warn the first time because the .exe isn't code-signed. Click *More info → Run anyway*.
+
+The two source-install options below are for developers or anyone who wants to modify the code.
+
+### Option 1 — uv (recommended for source install)
 
 If you don't have [uv](https://github.com/astral-sh/uv) yet:
 
@@ -52,6 +60,19 @@ python -m venv .venv
 pip install -r requirements.txt
 python main.py
 ```
+
+## Building the .exe yourself
+
+If you want to produce your own `RiotAccountSwitcher.exe` from source:
+
+```powershell
+# from a checked-out source tree with .venv set up:
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+This installs `pyinstaller` into the venv, runs the bundler with [`RiotAccountSwitcher.spec`](RiotAccountSwitcher.spec), and writes `dist\RiotAccountSwitcher.exe` (~46 MB).
+
+GitHub Actions also rebuilds on every push to `master` and every tag — see [`.github/workflows/build.yml`](.github/workflows/build.yml). Tag pushes (`git push origin vX.Y`) auto-publish a GitHub Release with the exe attached.
 
 ## First-time setup
 
