@@ -12,6 +12,7 @@ from src.models import Account
 from src.riot.api import (
     account_v1_url,
     is_cache_fresh,
+    league_v4_by_puuid_url,
     league_v4_url,
     regional_route_for,
     summoner_v4_url,
@@ -71,6 +72,13 @@ def test_summoner_v4_url():
 def test_league_v4_url():
     assert league_v4_url("SID-123", "na1") == (
         "https://na1.api.riotgames.com/lol/league/v4/entries/by-summoner/SID-123"
+    )
+
+
+def test_league_v4_by_puuid_url():
+    # The endpoint we actually use (avoids the deprecated summoner-id step).
+    assert league_v4_by_puuid_url("PUUID-XYZ", "kr") == (
+        "https://kr.api.riotgames.com/lol/league/v4/entries/by-puuid/PUUID-XYZ"
     )
 
 

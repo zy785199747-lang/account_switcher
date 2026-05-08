@@ -401,27 +401,39 @@ class MainWindow(QMainWindow):
         # Returns a callable suitable for AddAccountDialog. Captures self.
         def verify(candidate: Account) -> VerifyResult:
             # Pull the latest key in case admin updated it.
-            self._reload_api_client()
             try:
-                info = self.api_client.fetch_rank(candidate)
-            except RiotIdNotFound:
-                # Bad Riot ID is a user error, NOT an API outage. Don't flip
-                # the banner — just tell the user the ID is wrong.
-                return VerifyResult(False, "Player not found — check Game Name and Tag Line.")
-            except ApiUnavailable as exc:
-                self._set_api_available(False)
-                return VerifyResult(False, f"Riot API unavailable ({exc}).")
-            except RiotApiError as exc:
-                return VerifyResult(False, f"Riot API error: {exc}")
+                self._reload_api_client()
+                try:
+                    info = self.api_client.fetch_rank(candidate)
+                except RiotIdNotFound:
+                    # Bad Riot ID is a user error, NOT an API outage. Don't flip
+                    # the banner — just tell the user the ID is wrong.
+                    return VerifyResult(
+                        False,
+                        "Player not found — check Game Name and Tag Line.",
+                    )
+                except ApiUnavailable as exc:
+                    self._set_api_available(False)
+                    return VerifyResult(False, f"Riot API unavailable ({exc}).")
+                except RiotApiError as exc:
+                    return VerifyResult(False, f"Riot API error: {exc}")
 
-            self._set_api_available(True)
-            if info.tier is None:
-                return VerifyResult(True, "Riot ID found. Account is unranked.")
-            bits = [info.tier.title()]
-            if info.division:
-                bits.append(info.division)
-            if info.lp is not None:
-                bits.append(f"{info.lp} LP")
-            return VerifyResult(True, "Found: " + " ".join(bits))
+                self._set_api_available(True)
+                if info.tier is None:
+                    return VerifyResult(True, "Riot ID found. Account is unranked.")
+                bits = [info.tier.title()]
+                if info.division:
+                    bits.append(info.division)
+                if info.lp is not None:
+                    bits.append(f"{info.lp} LP")
+                return VerifyResult(True, "Found: " + " ".join(bits))
+            except Exception as exc:
+                # Catch-all so a bug in the verify path can't crash PyQt6.
+                # Logged with traceback so we can debug after the fact.
+                log.exception("verify callback crashed: %s", exc)
+                return VerifyResult(
+                    False,
+                    f"Internal error during verify ({exc}). See logs.",
+                )
 
         return verify

@@ -268,7 +268,15 @@ class AddAccountDialog(QDialog):
         self._show_verify_message("Checking with Riot...", "#888")
         self.repaint()
 
-        result = self._verify_callback(candidate)
+        # Catch-all so a bug in the callback never crashes the dialog/app.
+        try:
+            result = self._verify_callback(candidate)
+        except Exception as exc:
+            log.exception("verify callback raised unexpectedly: %s", exc)
+            result = VerifyResult(
+                False,
+                f"Internal error: {exc}. See logs.",
+            )
 
         self.verify_btn.setEnabled(True)
         if result.ok:

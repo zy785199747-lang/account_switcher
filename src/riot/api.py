@@ -6,16 +6,17 @@
 #      GET /riot/account/v1/accounts/by-riot-id/{gameName}/{tagLine}
 #      -> { "puuid": "...", "gameName": "...", "tagLine": "..." }
 #
-#   2. summoner-v4 (platform: na1, euw1, kr, ...)
-#      GET /lol/summoner/v4/summoners/by-puuid/{puuid}
-#      -> { "id": "<encrypted summoner id>", ... }
-#
-#   3. league-v4 (platform: same as summoner-v4)
-#      GET /lol/league/v4/entries/by-summoner/{summonerId}
+#   2. league-v4 (platform: na1, euw1, kr, ...)
+#      GET /lol/league/v4/entries/by-puuid/{puuid}
 #      -> [ { "queueType": "RANKED_SOLO_5x5", "tier": "DIAMOND", "rank": "II",
 #             "leaguePoints": 47, ... }, ... ]
 #
-# We chain those three calls to turn a Riot ID into solo-queue rank info.
+# We chain those two calls to turn a Riot ID into solo-queue rank info.
+#
+# (Older versions of this code had a summoner-v4 step in the middle to look up
+# an "encrypted summoner id". Riot is deprecating that field; the response no
+# longer reliably contains "id" on every account, which caused KeyError. The
+# by-puuid league-v4 endpoint avoids the whole problem.)
 #
 # Error handling:
 #   - 401/403/missing-key/network-error -> ApiUnavailable.
@@ -118,13 +119,22 @@ def account_v1_url(game_name: str, tag_line: str, regional_route: str) -> str:
 
 
 def summoner_v4_url(puuid: str, platform: str) -> str:
+    # Kept around in case we ever need profile icon / level. Not used in the
+    # rank-fetch path anymore because Riot is phasing out the encrypted "id".
     return (f"https://{platform}.api.riotgames.com"
             f"/lol/summoner/v4/summoners/by-puuid/{puuid}")
 
 
 def league_v4_url(summoner_id: str, platform: str) -> str:
+    # Legacy by-summoner endpoint. Kept for completeness; not used anymore.
     return (f"https://{platform}.api.riotgames.com"
             f"/lol/league/v4/entries/by-summoner/{summoner_id}")
+
+
+def league_v4_by_puuid_url(puuid: str, platform: str) -> str:
+    # The endpoint we actually use. Skips the deprecated summoner-id step.
+    return (f"https://{platform}.api.riotgames.com"
+            f"/lol/league/v4/entries/by-puuid/{puuid}")
 
 
 # ---------- result type ----------
@@ -193,17 +203,19 @@ class RiotApiClient:
 
     def get_puuid(self, game_name: str, tag_line: str, regional_route: str) -> str:
         data = self._get(account_v1_url(game_name, tag_line, regional_route))
-        return data["puuid"]  # type: ignore[index]
+        if not isinstance(data, dict) or "puuid" not in data:
+            # Defensive: log and raise rather than KeyError-crash the GUI.
+            log.warning("account-v1 response missing 'puuid': %r", data)
+            raise RiotApiError("Riot account-v1 response did not include a PUUID.")
+        return data["puuid"]
 
-    def get_summoner_id(self, puuid: str, platform: str) -> str:
-        data = self._get(summoner_v4_url(puuid, platform))
-        return data["id"]  # type: ignore[index]
-
-    def get_solo_rank(self, summoner_id: str, platform: str) -> RankInfo:
-        entries = self._get(league_v4_url(summoner_id, platform))
-        # entries is a list; find the solo-queue entry if present.
-        for e in entries:  # type: ignore[union-attr]
-            if e.get("queueType") == RANKED_SOLO_QUEUE:
+    def get_solo_rank_by_puuid(self, puuid: str, platform: str) -> RankInfo:
+        entries = self._get(league_v4_by_puuid_url(puuid, platform))
+        if not isinstance(entries, list):
+            log.warning("league-v4 by-puuid returned non-list: %r", entries)
+            raise RiotApiError("Riot league-v4 returned an unexpected shape.")
+        for e in entries:
+            if isinstance(e, dict) and e.get("queueType") == RANKED_SOLO_QUEUE:
                 return RankInfo(
                     tier=e.get("tier"),
                     division=e.get("rank"),
@@ -213,12 +225,10 @@ class RiotApiClient:
         return RankInfo(tier=None, division=None, lp=None)
 
     def fetch_rank(self, account: Account) -> RankInfo:
-        # Convenience: full chain Riot ID -> solo rank.
-        # Used by AddAccountDialog's Verify button and by refresh_rank below.
+        # Two-call chain: Riot ID -> PUUID -> solo rank.
         regional = regional_route_for(account.region)
         puuid = self.get_puuid(account.game_name, account.tag_line, regional)
-        sid = self.get_summoner_id(puuid, account.region)
-        return self.get_solo_rank(sid, account.region)
+        return self.get_solo_rank_by_puuid(puuid, account.region)
 
 
 # ---------- module-level convenience ----------

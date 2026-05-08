@@ -42,6 +42,20 @@ from src.ui.master_password import prompt_set_password, prompt_unlock
 log = logging.getLogger(__name__)
 
 
+def _install_excepthook() -> None:
+    # PyQt6 aborts the process on uncaught Python exceptions raised from
+    # inside Qt slots. Without a hook, we lose the traceback. Routing through
+    # logging.exception writes the full stack to app.log so we can debug.
+    def hook(exc_type, exc_value, exc_tb):
+        log.error(
+            "uncaught exception",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = hook
+
+
 # ---------- main flow ----------
 
 def parse_args() -> argparse.Namespace:
@@ -110,6 +124,7 @@ def acquire_vault(app: QApplication) -> Vault | None:
 def main() -> int:
     args = parse_args()
     log_file = setup_logging(debug=args.debug)
+    _install_excepthook()
     log.info("starting Riot Account Switcher (admin=%s, debug=%s)",
              args.admin, args.debug)
     log.info("logs: %s", log_file)
