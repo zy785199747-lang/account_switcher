@@ -35,10 +35,25 @@ from src.storage.vault import (
     VaultNotFound,
     default_vault_path,
 )
+from src.ui.admin_window import AdminWindow
 from src.ui.main_window import MainWindow
 from src.ui.master_password import prompt_set_password, prompt_unlock
 
 log = logging.getLogger(__name__)
+
+
+def _install_excepthook() -> None:
+    # PyQt6 aborts the process on uncaught Python exceptions raised from
+    # inside Qt slots. Without a hook, we lose the traceback. Routing through
+    # logging.exception writes the full stack to app.log so we can debug.
+    def hook(exc_type, exc_value, exc_tb):
+        log.error(
+            "uncaught exception",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = hook
 
 
 # ---------- main flow ----------
@@ -109,6 +124,7 @@ def acquire_vault(app: QApplication) -> Vault | None:
 def main() -> int:
     args = parse_args()
     log_file = setup_logging(debug=args.debug)
+    _install_excepthook()
     log.info("starting Riot Account Switcher (admin=%s, debug=%s)",
              args.admin, args.debug)
     log.info("logs: %s", log_file)
@@ -122,14 +138,12 @@ def main() -> int:
         return 0
 
     if args.admin:
-        # Stub for Phase 3. AdminWindow comes later.
-        QMessageBox.information(
-            None,
-            "Admin mode",
-            "Admin mode (--admin) will be implemented in Phase 3.\n\n"
-            "It will let you set the Riot API key.",
-        )
-        return 0
+        # Admin window manages the Riot API key. Single-purpose UI: no
+        # accounts, no cards, just the key field + Test + Save.
+        log.info("opening admin window")
+        admin = AdminWindow(vault)
+        admin.show()
+        return app.exec()
 
     # Lock loop: when the user clicks the toolbar Lock button, the window
     # closes with `was_locked = True`. We then re-prompt for the master

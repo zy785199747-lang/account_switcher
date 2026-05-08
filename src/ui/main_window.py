@@ -14,6 +14,7 @@
 # Phase 2 — there is no API yet for it to react to. Phase 3 wires it.
 
 import logging
+import time
 from typing import Optional
 
 from PyQt6.QtCore import Qt
@@ -32,9 +33,20 @@ from PyQt6.QtWidgets import (
 )
 
 from src.models import Account
+from src.riot.api import (
+    ApiUnavailable,
+    RiotApiClient,
+    RiotApiError,
+    RiotIdNotFound,
+    refresh_rank,
+)
 from src.storage.vault import Vault
 from src.ui.account_card import AccountCard
-from src.ui.add_account_dialog import AddAccountDialog
+from src.ui.add_account_dialog import AddAccountDialog, VerifyResult
+
+# Vault config keys (kept consistent with admin_window.py).
+CFG_API_KEY = "riot_api_key"
+CFG_LAST_API_SUCCESS = "riot_api_last_success"
 
 CARDS_PER_ROW = 3
 
@@ -48,6 +60,14 @@ class MainWindow(QMainWindow):
         self.was_locked = False  # main.py reads this to decide whether to re-prompt unlock
 
         self._cards: list[AccountCard] = []  # keep refs so signals stay connected
+
+        # Per-window API client. Reads the key from the vault config.
+        self.api_client = RiotApiClient(
+            api_key=self.vault.get_config(CFG_API_KEY, "") or ""
+        )
+        # Whether the most recent API attempt succeeded. We don't proactively
+        # ping on startup — banner appears the first time something fails.
+        self._api_available: Optional[bool] = None
 
         self.setWindowTitle("Riot Account Switcher")
         self.resize(820, 600)
@@ -173,7 +193,12 @@ class MainWindow(QMainWindow):
     def _on_add_clicked(self) -> None:
         log.info("add account clicked")
         default_region = self.vault.get_config("default_region", "na1")
-        dlg = AddAccountDialog(self, default_region=default_region)
+        # Only pass a verify callback when the API looks usable. If we've
+        # already seen it fail this session we hide the Verify button so the
+        # user isn't tempted to wait for a slow timeout.
+        verify_cb = self._build_verify_callback() if self._api_seems_usable() else None
+        dlg = AddAccountDialog(self, default_region=default_region,
+                               verify_callback=verify_cb)
         if dlg.exec() != AddAccountDialog.DialogCode.Accepted:
             return
         new_account = dlg.get_account()
@@ -185,6 +210,10 @@ class MainWindow(QMainWindow):
             log.exception("vault.add failed")
             QMessageBox.critical(self, "Could not save account", str(exc))
             return
+        # Best-effort: try to fetch the rank straight away so the new card
+        # isn't blank. Silent failure — the card just stays blank if API down.
+        if self._api_seems_usable():
+            self._try_refresh_one(new_account)
         self._refresh_grid()
 
     def _find_account(self, account_id: str) -> Optional[Account]:
@@ -199,7 +228,8 @@ class MainWindow(QMainWindow):
         if existing is None:
             log.warning("edit: account_id=%s not found", account_id)
             return
-        dlg = AddAccountDialog(self, account=existing)
+        verify_cb = self._build_verify_callback() if self._api_seems_usable() else None
+        dlg = AddAccountDialog(self, account=existing, verify_callback=verify_cb)
         if dlg.exec() != AddAccountDialog.DialogCode.Accepted:
             return
         updated = dlg.get_account()
@@ -252,19 +282,55 @@ class MainWindow(QMainWindow):
         )
 
     def _on_refresh_clicked(self) -> None:
-        # Phase 3 wires this to the Riot API.
-        log.info("refresh ranks clicked (Phase 3 not yet built)")
-        QMessageBox.information(
-            self,
-            "Refresh Ranks (Phase 3)",
-            "Phase 3 will fetch live ranks from the Riot API.\n"
-            "Right now there is no API integration so this does nothing.",
-        )
+        # Refresh every account's rank. Silent on per-account failures (we
+        # just leave the cached data alone). The banner shows up if any
+        # call fails with ApiUnavailable.
+        log.info("refresh ranks clicked (%d accounts)", len(self.vault.accounts))
+        if not self.vault.accounts:
+            return
+
+        # Pull the API key fresh in case admin changed it since startup.
+        self._reload_api_client()
+
+        had_success = False
+        had_unavailable = False
+        for account in list(self.vault.accounts):
+            try:
+                changed = refresh_rank(self.api_client, account, force=True)
+                if changed:
+                    had_success = True
+                    self.vault.update(account)
+            except ApiUnavailable as exc:
+                log.info("refresh: api unavailable (%s)", exc)
+                had_unavailable = True
+                break  # no point trying the rest with the same broken key
+            except RiotApiError as exc:
+                log.warning("refresh: api error for %s#%s: %s",
+                            account.game_name, account.tag_line, exc)
+                # Keep going — one bad Riot ID shouldn't stop the whole batch.
+
+        # Update banner state based on what happened.
+        if had_unavailable:
+            self._set_api_available(False)
+        elif had_success or self.vault.accounts:
+            # If we got even one success (or there was nothing to fail), API
+            # looks fine. Hide the banner if it was up.
+            self._set_api_available(True)
+
+        self._refresh_grid()
+        if had_success:
+            self.statusBar().showMessage(
+                f"Ranks refreshed at {time.strftime('%H:%M:%S')}", 5000
+            )
 
     def _on_refresh_one(self, account_id: str) -> None:
-        log.info("refresh-one for account_id=%s (Phase 3 not yet built)", account_id)
-        # Same stub as the toolbar refresh.
-        self._on_refresh_clicked()
+        log.info("refresh-one for account_id=%s", account_id)
+        existing = self._find_account(account_id)
+        if existing is None:
+            return
+        self._reload_api_client()
+        self._try_refresh_one(existing, force=True)
+        self._refresh_grid()
 
     def _on_settings_clicked(self) -> None:
         # Phase 5 fills this with region, install path, auto-fill mode.
@@ -282,3 +348,92 @@ class MainWindow(QMainWindow):
         # Closing the window returns control to main.py, which checks
         # was_locked and re-prompts for the master password.
         self.close()
+
+    # ---------- API plumbing ----------
+
+    def _reload_api_client(self) -> None:
+        # If the admin changed the key (via `--admin`) while this window was
+        # open, picking it up is as cheap as re-reading from the vault config.
+        # Vault.unlock loaded the latest config when the window was opened;
+        # if Lock + unlock happened in between, we already have the latest.
+        latest = self.vault.get_config(CFG_API_KEY, "") or ""
+        if latest != self.api_client.api_key:
+            log.info("api key changed in vault, refreshing client")
+            self.api_client = RiotApiClient(api_key=latest)
+
+    def _api_seems_usable(self) -> bool:
+        # Rule: assume usable until proven otherwise. Only flip to "not
+        # usable" after we've had a real ApiUnavailable.
+        # No key configured -> definitely not usable.
+        if not self.api_client.api_key:
+            return False
+        return self._api_available is not False
+
+    def _set_api_available(self, available: bool) -> None:
+        if self._api_available == available:
+            return  # no change
+        self._api_available = available
+        if available:
+            log.info("API marked available, hiding banner")
+            self.banner.hide()
+        else:
+            log.info("API marked unavailable, showing banner")
+            self.banner.show()
+
+    def _try_refresh_one(self, account: Account, force: bool = False) -> None:
+        # Fetch one account's rank. Updates the vault if it succeeded. Updates
+        # the banner state on ApiUnavailable. Other errors are logged and
+        # silenced — UI stays clean.
+        try:
+            changed = refresh_rank(self.api_client, account, force=force)
+            if changed:
+                self.vault.update(account)
+            self._set_api_available(True)
+        except ApiUnavailable as exc:
+            log.info("api unavailable while refreshing %s#%s: %s",
+                     account.game_name, account.tag_line, exc)
+            self._set_api_available(False)
+        except RiotApiError as exc:
+            log.warning("api error for %s#%s: %s",
+                        account.game_name, account.tag_line, exc)
+
+    def _build_verify_callback(self):
+        # Returns a callable suitable for AddAccountDialog. Captures self.
+        def verify(candidate: Account) -> VerifyResult:
+            # Pull the latest key in case admin updated it.
+            try:
+                self._reload_api_client()
+                try:
+                    info = self.api_client.fetch_rank(candidate)
+                except RiotIdNotFound:
+                    # Bad Riot ID is a user error, NOT an API outage. Don't flip
+                    # the banner — just tell the user the ID is wrong.
+                    return VerifyResult(
+                        False,
+                        "Player not found — check Game Name and Tag Line.",
+                    )
+                except ApiUnavailable as exc:
+                    self._set_api_available(False)
+                    return VerifyResult(False, f"Riot API unavailable ({exc}).")
+                except RiotApiError as exc:
+                    return VerifyResult(False, f"Riot API error: {exc}")
+
+                self._set_api_available(True)
+                if info.tier is None:
+                    return VerifyResult(True, "Riot ID found. Account is unranked.")
+                bits = [info.tier.title()]
+                if info.division:
+                    bits.append(info.division)
+                if info.lp is not None:
+                    bits.append(f"{info.lp} LP")
+                return VerifyResult(True, "Found: " + " ".join(bits))
+            except Exception as exc:
+                # Catch-all so a bug in the verify path can't crash PyQt6.
+                # Logged with traceback so we can debug after the fact.
+                log.exception("verify callback crashed: %s", exc)
+                return VerifyResult(
+                    False,
+                    f"Internal error during verify ({exc}). See logs.",
+                )
+
+        return verify
