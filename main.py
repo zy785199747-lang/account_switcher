@@ -22,12 +22,16 @@ import argparse
 import logging
 import sys
 
+from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QMessageBox,
 )
 
 from src.logging_setup import setup as setup_logging
+from src.riot.launcher import find_riot_install_path
 from src.storage.crypto import InvalidPassword
 from src.storage.vault import (
     CorruptVault,
@@ -38,6 +42,10 @@ from src.storage.vault import (
 from src.ui.admin_window import AdminWindow
 from src.ui.main_window import MainWindow
 from src.ui.master_password import prompt_set_password, prompt_unlock
+
+# Same vault key MainWindow uses. Kept in sync manually for now (a future
+# config module could centralise these constants).
+CFG_RIOT_INSTALL_PATH = "riot_install_path"
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +78,55 @@ def parse_args() -> argparse.Namespace:
 def show_error(parent, title: str, message: str) -> None:
     # Plain dialog used for fatal errors. Logging already captured the details.
     QMessageBox.critical(parent, title, message)
+
+
+def ensure_install_path(vault: Vault) -> bool:
+    # Make sure the vault has a working `riot_install_path`. Called at startup
+    # (in normal mode, not --admin) so the user is never surprised by a file
+    # picker the moment they click their first account card.
+    #
+    # Resolution order:
+    #   1. Cached value in the vault — if the file still exists, use it.
+    #   2. Auto-detect: registry → running process → drive scan.
+    #      Cache the result on success.
+    #   3. File picker dialog. Cache the result on success.
+    #
+    # Returns True if a path was resolved (and cached), False if the user
+    # cancelled the picker. main.py treats False as "exit cleanly".
+    cached = vault.get_config(CFG_RIOT_INSTALL_PATH)
+    if cached and Path(cached).exists():
+        log.info("using cached riot install path: %s", cached)
+        return True
+    if cached:
+        log.info("cached install path %s no longer exists, redetecting", cached)
+
+    detected = find_riot_install_path()
+    if detected:
+        vault.set_config(CFG_RIOT_INSTALL_PATH, detected)
+        log.info("auto-detected and cached riot install path: %s", detected)
+        return True
+
+    # Last resort: ask the user.
+    QMessageBox.information(
+        None,
+        "Locate Riot Client",
+        "We couldn't auto-detect Riot Client on this computer.\n\n"
+        "Please point us at RiotClientServices.exe.\n"
+        "It's usually at C:\\Riot Games\\Riot Client\\RiotClientServices.exe",
+    )
+    path, _ = QFileDialog.getOpenFileName(
+        None,
+        "Locate RiotClientServices.exe",
+        "C:/",
+        "RiotClientServices.exe (RiotClientServices.exe)",
+    )
+    if not path:
+        log.info("user cancelled install-path picker")
+        return False
+
+    vault.set_config(CFG_RIOT_INSTALL_PATH, path)
+    log.info("user chose riot install path: %s", path)
+    return True
 
 
 def acquire_vault(app: QApplication) -> Vault | None:
@@ -140,10 +197,17 @@ def main() -> int:
     if args.admin:
         # Admin window manages the Riot API key. Single-purpose UI: no
         # accounts, no cards, just the key field + Test + Save.
+        # Skip install-path resolution: admin doesn't launch Riot.
         log.info("opening admin window")
         admin = AdminWindow(vault)
         admin.show()
         return app.exec()
+
+    # Make sure we know where Riot Client lives BEFORE opening the main UI,
+    # so the user never gets a surprise file picker mid-click.
+    if not ensure_install_path(vault):
+        log.info("install-path resolution cancelled, exiting")
+        return 0
 
     # Lock loop: when the user clicks the toolbar Lock button, the window
     # closes with `was_locked = True`. We then re-prompt for the master

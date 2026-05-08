@@ -24,6 +24,7 @@
 import logging
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -41,6 +42,13 @@ except ImportError:  # pragma: no cover
     pywinauto = None
     pwa_keyboard = None
     PYWINAUTO_AVAILABLE = False
+
+# winreg is Windows-only (Python stdlib). Wrap so the module imports on Linux
+# during pytest runs.
+if sys.platform == "win32":
+    import winreg  # type: ignore[import-not-found]
+else:  # pragma: no cover
+    winreg = None  # type: ignore[assignment]
 
 # ---------- tweakable constants ----------
 
@@ -172,6 +180,113 @@ def clear_riot_session() -> bool:
         # account and the user has to click Sign Out manually.
         log.warning("could not delete %s: %s", path, exc)
         return False
+
+
+# ---------- install-path auto-detection ----------
+#
+# Resolution order used by callers:
+#   1. Whatever the vault has cached as `riot_install_path` (set after a
+#      previous successful detect or via the Settings dialog later).
+#   2. find_riot_install_path() — registry → running process → drive scan.
+#   3. UI fallback: prompt the user with a file picker.
+#
+# Each helper returns the absolute path to RiotClientServices.exe, or None.
+
+# Registry paths we probe, in priority order.
+_REGISTRY_INSTALL_LOCATION_KEYS = [
+    # 64-bit view of the 32-bit installer (Riot ships an x86 installer that
+    # lands here on 64-bit Windows).
+    (r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Riot Game riot_client.live", "InstallLocation"),
+    # 32-bit Windows or recent installs that don't go through the WOW node.
+    (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Riot Game riot_client.live", "InstallLocation"),
+]
+
+
+def _from_registry() -> Optional[str]:
+    # Look up Riot Client's install folder via the Windows registry.
+    if sys.platform != "win32" or winreg is None:
+        return None
+    for subkey, value in _REGISTRY_INSTALL_LOCATION_KEYS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey) as k:
+                folder, _kind = winreg.QueryValueEx(k, value)
+        except OSError:
+            continue
+        exe = Path(folder) / "RiotClientServices.exe"
+        if exe.exists():
+            return str(exe)
+    # Last resort: the riotclient:// URI handler. The default value of
+    # HKEY_CLASSES_ROOT\riotclient\shell\open\command is a command line that
+    # starts with the full path in quotes.
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"riotclient\shell\open\command") as k:
+            cmd, _kind = winreg.QueryValueEx(k, None)
+    except OSError:
+        return None
+    if isinstance(cmd, str) and cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        if end > 1:
+            exe = cmd[1:end]
+            if Path(exe).exists():
+                return exe
+    return None
+
+
+def _from_running_process() -> Optional[str]:
+    # Free path: if Riot Client is already running, psutil tells us where its
+    # binary lives. Useful when the user previously launched Riot manually.
+    target = "riotclientservices.exe"
+    for p in psutil.process_iter(["name", "exe"]):
+        try:
+            name = (p.info.get("name") or "").lower()
+            if name != target:
+                continue
+            exe = p.info.get("exe")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if exe and Path(exe).exists():
+            return exe
+    return None
+
+
+def _from_filesystem_search() -> Optional[str]:
+    # Scan every fixed drive for the standard install layout.
+    # Cheap on modern Windows (drive root listing is O(1)) — only the path
+    # existence check actually touches disk.
+    if sys.platform != "win32":
+        return None
+    relative = Path("Riot Games") / "Riot Client" / "RiotClientServices.exe"
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        drive = Path(f"{letter}:/")
+        if not drive.exists():
+            continue
+        candidate = drive / relative
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def find_riot_install_path() -> Optional[str]:
+    # Try the three strategies in order. First hit wins.
+    log.info("auto-detecting Riot Client install path")
+
+    found = _from_registry()
+    if found:
+        log.info("install path via registry: %s", found)
+        return found
+
+    found = _from_running_process()
+    if found:
+        log.info("install path via running process: %s", found)
+        return found
+
+    found = _from_filesystem_search()
+    if found:
+        log.info("install path via filesystem scan: %s", found)
+        return found
+
+    log.info("install path: auto-detect failed")
+    return None
 
 
 # ---------- launching ----------

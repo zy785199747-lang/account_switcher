@@ -15,11 +15,13 @@
 
 import logging
 import time
+from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -41,7 +43,10 @@ from src.riot.api import (
     RiotIdNotFound,
     refresh_rank,
 )
-from src.riot.launcher import DEFAULT_RIOT_INSTALL_PATH
+from src.riot.launcher import (
+    DEFAULT_RIOT_INSTALL_PATH,
+    find_riot_install_path,
+)
 from src.storage.vault import Vault
 from src.ui.account_card import AccountCard
 from src.ui.add_account_dialog import AddAccountDialog, VerifyResult
@@ -296,9 +301,13 @@ class MainWindow(QMainWindow):
             log.warning("switch: account_id=%s not found", account_id)
             return
 
-        install_path = self.vault.get_config(
-            CFG_RIOT_INSTALL_PATH, DEFAULT_RIOT_INSTALL_PATH
-        )
+        # main.py guarantees a valid install path is in the vault at startup.
+        # If the file disappeared mid-session (uninstall, drive ejected) the
+        # picker fallback handles it.
+        install_path = self._resolve_install_path()
+        if install_path is None:
+            log.info("switch aborted: no install path available")
+            return
         riot_id = f"{existing.game_name}#{existing.tag_line}"
 
         # Progress dialog — modal, no cancel button (cancelling mid-launch is
@@ -358,6 +367,39 @@ class MainWindow(QMainWindow):
         if self._switch_thread is not None:
             self._switch_thread.deleteLater()
             self._switch_thread = None
+
+    # ---------- install path (mid-session fallback only) ----------
+    #
+    # main.py runs the full resolve-and-cache flow at startup, so by the time
+    # the main window is open the vault SHOULD have a valid path. These
+    # methods exist for the rare case where the file disappears mid-session
+    # (Riot uninstalled, USB drive ejected, etc.).
+
+    def _resolve_install_path(self) -> Optional[str]:
+        cached = self.vault.get_config(CFG_RIOT_INSTALL_PATH)
+        if cached and Path(cached).exists():
+            return cached
+        if cached:
+            log.info("cached install path %s no longer exists, asking user", cached)
+        return self._prompt_for_install_path()
+
+    def _prompt_for_install_path(self) -> Optional[str]:
+        QMessageBox.information(
+            self,
+            "Riot Client not found",
+            "The Riot Client was not where we expected.\n\n"
+            "Please point us at RiotClientServices.exe.",
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Locate RiotClientServices.exe",
+            "C:/",
+            "RiotClientServices.exe (RiotClientServices.exe)",
+        )
+        if not path:
+            return None
+        self.vault.set_config(CFG_RIOT_INSTALL_PATH, path)
+        return path
 
     def _on_refresh_clicked(self) -> None:
         # Refresh every account's rank. Silent on per-account failures (we
