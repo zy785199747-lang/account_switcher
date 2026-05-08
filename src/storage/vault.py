@@ -170,6 +170,36 @@ class Vault:
         self.accounts = []
         self.config = {}
 
+    def reload(self) -> None:
+        # Reload vault contents from disk without requiring master password.
+        # Useful when another instance has written changes.
+        if self._master_key is None or self._salt is None:
+            raise RuntimeError("cannot reload vault before unlock/create")
+
+        if not self.path.exists():
+            raise VaultNotFound(f"vault file disappeared: {self.path}")
+
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise CorruptVault(f"vault file is not valid JSON: {exc}") from exc
+
+        try:
+            ciphertext = base64.b64decode(raw["ciphertext"])
+        except (KeyError, ValueError) as exc:
+            raise CorruptVault(f"vault file missing ciphertext: {exc}") from exc
+
+        plaintext = decrypt(ciphertext, self._master_key)
+        try:
+            payload = json.loads(plaintext.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise CorruptVault(f"vault payload is not valid JSON: {exc}") from exc
+
+        self.accounts = [Account.from_dict(d) for d in payload.get("accounts", [])]
+        self.config = payload.get("config", {})
+        log.info("vault reloaded: %d accounts, %d config keys",
+                 len(self.accounts), len(self.config))
+
     # ---------- account CRUD ----------
 
     def add(self, account: Account) -> None:

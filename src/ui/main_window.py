@@ -455,10 +455,15 @@ class MainWindow(QMainWindow):
 
     def _on_settings_clicked(self) -> None:
         log.info("settings clicked")
+        # Refresh vault to ensure we have latest config from disk
+        try:
+            self.vault.reload()
+        except Exception as exc:
+            log.warning("could not reload vault: %s", exc)
         dlg = SettingsDialog(self.vault, parent=self)
         if dlg.exec() != SettingsDialog.DialogCode.Accepted:
             return
-        # Reload API client in case the key changed.
+        # Reload API client in case the key changed
         self._reload_api_client()
 
     def _on_lock_clicked(self) -> None:

@@ -196,8 +196,17 @@ class SettingsDialog(QDialog):
             log.info("settings: saving API key (length=%d)", len(key))
             try:
                 self.vault.set_config(CFG_API_KEY, key)
+                log.info("settings: API key saved successfully")
             except Exception as exc:
                 log.exception("vault save failed")
                 QMessageBox.critical(self, "Save failed", str(exc))
+                return
+        else:
+            log.info("settings: clearing API key")
+            try:
+                self.vault.set_config(CFG_API_KEY, "")
+            except Exception as exc:
+                log.exception("vault clear failed")
+                QMessageBox.critical(self, "Clear failed", str(exc))
                 return
         self.accept()
