@@ -16,7 +16,19 @@ env/
 accounts.json
 *.key
 *.token
+*.enc
 config.local.*
+test_vault.enc
+test_vault*.enc
+
+# Logs and runtime data
+logs/
+*.log
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
 
 # IDE
 .vscode/
@@ -27,3 +39,6 @@ config.local.*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Claude Code
+.claude/
