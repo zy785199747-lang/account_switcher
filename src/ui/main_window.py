@@ -50,6 +50,7 @@ from src.riot.launcher import (
 from src.storage.vault import Vault
 from src.ui.account_card import AccountCard
 from src.ui.add_account_dialog import AddAccountDialog, VerifyResult
+from src.ui.settings_dialog import SettingsDialog
 from src.ui.switch_worker import SwitchWorker
 
 # Vault config keys (kept consistent with admin_window.py).
@@ -453,14 +454,12 @@ class MainWindow(QMainWindow):
         self._refresh_grid()
 
     def _on_settings_clicked(self) -> None:
-        # Phase 5 fills this with region, install path, auto-fill mode.
-        log.info("settings clicked (Phase 5 not yet built)")
-        QMessageBox.information(
-            self,
-            "Settings (Phase 5)",
-            "Settings panel (region, Riot Client install path, auto-fill mode) "
-            "comes in Phase 5.",
-        )
+        log.info("settings clicked")
+        dlg = SettingsDialog(self.vault, parent=self)
+        if dlg.exec() != SettingsDialog.DialogCode.Accepted:
+            return
+        # Reload API client in case the key changed.
+        self._reload_api_client()
 
     def _on_lock_clicked(self) -> None:
         log.info("lock clicked")
