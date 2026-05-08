@@ -35,6 +35,7 @@ from src.storage.vault import (
     VaultNotFound,
     default_vault_path,
 )
+from src.ui.admin_window import AdminWindow
 from src.ui.main_window import MainWindow
 from src.ui.master_password import prompt_set_password, prompt_unlock
 
@@ -122,14 +123,12 @@ def main() -> int:
         return 0
 
     if args.admin:
-        # Stub for Phase 3. AdminWindow comes later.
-        QMessageBox.information(
-            None,
-            "Admin mode",
-            "Admin mode (--admin) will be implemented in Phase 3.\n\n"
-            "It will let you set the Riot API key.",
-        )
-        return 0
+        # Admin window manages the Riot API key. Single-purpose UI: no
+        # accounts, no cards, just the key field + Test + Save.
+        log.info("opening admin window")
+        admin = AdminWindow(vault)
+        admin.show()
+        return app.exec()
 
     # Lock loop: when the user clicks the toolbar Lock button, the window
     # closes with `was_locked = True`. We then re-prompt for the master
