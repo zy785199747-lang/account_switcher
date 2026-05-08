@@ -107,7 +107,54 @@ Run `.venv\Scripts\python.exe scripts\seed_test_vault.py` to wipe-and-reseed the
 
 ## Phase 3 — Riot API + AdminWindow (`v0.3-api`)
 
-(filled in when Phase 3 starts)
+### Automated
+- [x] All previous tests still pass (53/53 = 27 vault + 10 crypto + 16 API URL tests)
+- [x] Headless smoke test: AccountCard renders fresh/stale/unranked, banner toggles, AdminWindow constructs
+
+### Manual
+
+**You'll need a Riot dev API key** for the API portions. Get one at https://developer.riotgames.com/. The key expires in 24h — that's expected and is what we're testing for.
+
+1. **Admin window opens via flag**
+   - [ ] `.venv\Scripts\python.exe main.py --admin` → unlock dialog → AdminWindow appears
+   - [ ] Two buttons at bottom of dev-portal links open browser tabs
+   - [ ] *Show* toggles the API key field between dots and plaintext
+
+2. **Test key**
+   - [ ] Paste a valid key, click *Test key* → green ✓ "key is valid", "Last successful call" updates
+   - [ ] Replace with a clearly bad key (e.g. "RGAPI-broken"), click *Test key* → red ✗ "key rejected"
+   - [ ] Empty field + *Test key* → ✗ "no key entered"
+
+3. **Save key**
+   - [ ] Paste valid key → *Save* → "API key saved" popup
+   - [ ] Close admin window → run `python main.py` (no flag) → main window opens normally
+   - [ ] Walk every menu/dialog: confirm API key is NOT visible anywhere in the user UI
+
+4. **Verify in Add Account dialog**
+   - [ ] With valid key set: Add Account → fill form with a real Riot ID → click *Verify* → green ✓ "Found: Diamond II 47 LP" (or whatever the real rank is)
+   - [ ] Verify with a bogus Riot ID like `Nope#Z9Z9Z9` → red ✗ "Player not found"
+   - [ ] Submit Save → card appears with the rank already filled in
+
+5. **Refresh Ranks toolbar**
+   - [ ] With valid key + at least 1 account: click *Refresh Ranks* → status bar briefly shows "Ranks refreshed at HH:MM:SS"
+   - [ ] Card text updates if rank changed (compare to before)
+
+6. **API failure banner (informational only)**
+   - [ ] Run `python main.py --admin`, paste a deliberately broken key, Save
+   - [ ] Run `python main.py` → click *Refresh Ranks* → soft yellow/amber banner appears reading exactly *"Rank info is temporarily unavailable"* with NO buttons
+   - [ ] Cards still show their cached ranks
+   - [ ] Click *Add Account* → Verify button is HIDDEN (form still works without it)
+
+7. **Banner auto-clears**
+   - [ ] Run `python main.py --admin` again, paste good key, Save
+   - [ ] Run `python main.py` → click *Refresh Ranks* → banner disappears, ranks update
+
+8. **Stale tag**
+   - [ ] After a successful refresh, leave the app running for ≥24h (or temporarily edit the system clock forward) → stale tag "(updated Xh ago)" appears under the rank text
+   - [ ] Push beyond 7 days → tag turns amber
+
+9. **Right-click refresh single card**
+   - [ ] Right-click a card → *Refresh rank* → that one card updates (others untouched)
 
 ---
 

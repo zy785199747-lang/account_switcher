@@ -21,6 +21,7 @@
 # Same for Refresh (Phase 3) — the menu item is there but inert until then.
 
 import logging
+import time
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction
@@ -39,6 +40,13 @@ CARD_WIDTH = 240
 CARD_HEIGHT = 160
 HOVER_ICON_SIZE = 26
 HOVER_ICON_MARGIN = 6  # distance from the top-right corner
+
+# Rank "freshness" thresholds for the stale tag.
+# Anything younger than the first threshold = no tag.
+# Between first and second = grey "(updated Xh ago)".
+# Older than second = amber "(updated Xd ago)".
+STALE_GREY_AFTER_SECONDS = 24 * 3600       # 24h
+STALE_AMBER_AFTER_SECONDS = 7 * 24 * 3600  # 7d
 
 log = logging.getLogger(__name__)
 
@@ -96,10 +104,16 @@ class AccountCard(QFrame):
 
         layout.addStretch(1)
 
-        # Rank text. Phase 2: no API yet, so always show placeholder.
+        # Rank text + small staleness tag below it.
         self.rank_label = QLabel(self._format_rank())
         self.rank_label.setStyleSheet("color: #ccc;")
         layout.addWidget(self.rank_label)
+
+        self.stale_label = QLabel("")
+        self.stale_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.stale_label.setVisible(False)
+        layout.addWidget(self.stale_label)
+        self._refresh_stale_label()
 
     def _build_hover_icons(self) -> None:
         # Buttons are children of `self`. They sit on top of the card and
@@ -147,16 +161,45 @@ class AccountCard(QFrame):
         return f"{gn}#{tag}"
 
     def _format_rank(self) -> str:
-        # Phase 2 has no Riot API yet, so cached_tier is always None.
-        # Phase 3 fills these in. Keep this tiny so the swap is one line.
-        if self.account.cached_tier is None:
+        # Cached fields are filled by the Riot API (Phase 3+). When they're
+        # all None, we distinguish "never fetched" (cached_at is None) from
+        # "fetched but no rank" (cached_at set but tier is None = unranked).
+        if self.account.cached_at is None:
             return "Rank not loaded yet"
-        bits = [self.account.cached_tier]
+        if self.account.cached_tier is None:
+            return "Unranked"
+        bits = [self.account.cached_tier.title()]  # "DIAMOND" -> "Diamond"
         if self.account.cached_division:
             bits.append(self.account.cached_division)
         if self.account.cached_lp is not None:
             bits.append(f"{self.account.cached_lp} LP")
         return " ".join(bits)
+
+    def _refresh_stale_label(self) -> None:
+        # Show "(updated Xh ago)" when the cache is older than 24h.
+        # Hidden when there's no cache at all or when it's fresh.
+        cached_at = self.account.cached_at
+        if cached_at is None:
+            self.stale_label.setVisible(False)
+            return
+        age = time.time() - cached_at
+        if age < STALE_GREY_AFTER_SECONDS:
+            self.stale_label.setVisible(False)
+            return
+
+        # Format a friendly age string.
+        if age < 7 * 24 * 3600:
+            hours = int(age // 3600)
+            text = f"(updated {hours}h ago)"
+        else:
+            days = int(age // (24 * 3600))
+            text = f"(updated {days}d ago)"
+
+        # Amber once it crosses the second threshold.
+        color = "#888" if age < STALE_AMBER_AFTER_SECONDS else "#d49a2c"
+        self.stale_label.setStyleSheet(f"color: {color}; font-size: 10px;")
+        self.stale_label.setText(text)
+        self.stale_label.setVisible(True)
 
     # ---------- public API for MainWindow ----------
 
@@ -167,6 +210,7 @@ class AccountCard(QFrame):
         self.riot_id_label.setText(self._format_riot_id())
         self.region_label.setText(account.region.upper())
         self.rank_label.setText(self._format_rank())
+        self._refresh_stale_label()
 
     # ---------- event handlers ----------
 
