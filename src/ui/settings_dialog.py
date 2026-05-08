@@ -181,7 +181,8 @@ class SettingsDialog(QDialog):
             self.test_result.setText("✓ key is valid")
             self.test_result.setStyleSheet("color: #2a9d2a;")
             self.vault.set_config(CFG_LAST_API_SUCCESS, time.time())
-            self._load_from_vault()
+            # Only reload the timestamp label, not the key field
+            self._refresh_last_success_label()
         else:
             log.info("settings: API key test failed")
             msg = "✗ key rejected"
@@ -189,6 +190,20 @@ class SettingsDialog(QDialog):
                 msg += f" ({err_text})"
             self.test_result.setText(msg)
             self.test_result.setStyleSheet("color: #b00020;")
+
+    def _refresh_last_success_label(self) -> None:
+        # Only reload the last success timestamp, not the key field
+        last = self.vault.get_config(CFG_LAST_API_SUCCESS)
+        if last:
+            try:
+                ts = datetime.fromtimestamp(float(last))
+                self.last_success_label.setText(
+                    ts.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            except (TypeError, ValueError):
+                self.last_success_label.setText("(invalid timestamp)")
+        else:
+            self.last_success_label.setText("never")
 
     def _on_ok(self) -> None:
         key = self.api_key_field.text().strip()
