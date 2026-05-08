@@ -1,0 +1,7 @@
+# Phase 1 needs PyQt6 for the master password dialog and cryptography for the vault.
+# Other deps (requests, pywinauto, psutil) come in later phases.
+PyQt6>=6.6
+cryptography>=42
+
+# Test runner
+pytest>=8.0
