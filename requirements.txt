@@ -1,9 +1,12 @@
 # Phase 1: PyQt6 for the master password dialog, cryptography for the vault.
 # Phase 3: requests for talking to the Riot API.
-# Phase 4 will add pywinauto + psutil.
+# Phase 4: psutil to find/kill Riot processes, pywinauto to detect the Riot
+#          Client login window and send keystrokes into it.
 PyQt6>=6.6
 cryptography>=42
 requests>=2.31
+psutil>=5.9
+pywinauto>=0.6.8 ; sys_platform == 'win32'
 
 # Test runner
 pytest>=8.0

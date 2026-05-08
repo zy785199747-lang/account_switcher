@@ -15,17 +15,20 @@
 
 import logging
 import time
+from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QScrollArea,
     QToolBar,
     QVBoxLayout,
@@ -40,13 +43,19 @@ from src.riot.api import (
     RiotIdNotFound,
     refresh_rank,
 )
+from src.riot.launcher import (
+    DEFAULT_RIOT_INSTALL_PATH,
+    find_riot_install_path,
+)
 from src.storage.vault import Vault
 from src.ui.account_card import AccountCard
 from src.ui.add_account_dialog import AddAccountDialog, VerifyResult
+from src.ui.switch_worker import SwitchWorker
 
 # Vault config keys (kept consistent with admin_window.py).
 CFG_API_KEY = "riot_api_key"
 CFG_LAST_API_SUCCESS = "riot_api_last_success"
+CFG_RIOT_INSTALL_PATH = "riot_install_path"
 
 CARDS_PER_ROW = 3
 
@@ -68,6 +77,12 @@ class MainWindow(QMainWindow):
         # Whether the most recent API attempt succeeded. We don't proactively
         # ping on startup — banner appears the first time something fails.
         self._api_available: Optional[bool] = None
+
+        # Switch-flow plumbing. Held as attributes so Python doesn't garbage-
+        # collect the QThread/worker mid-flight.
+        self._switch_thread: Optional[QThread] = None
+        self._switch_worker: Optional[SwitchWorker] = None
+        self._switch_dialog: Optional[QProgressDialog] = None
 
         self.setWindowTitle("Riot Account Switcher")
         self.resize(820, 600)
@@ -269,17 +284,122 @@ class MainWindow(QMainWindow):
     # ---------- actions: stubs filled in by later phases ----------
 
     def _on_switch(self, account_id: str) -> None:
-        # Phase 4 wires this to the launcher.
-        log.info("switch requested for account_id=%s (Phase 4 not yet built)", account_id)
+        # Kick off the kill -> launch -> autofill pipeline on a worker thread.
+        # Shows a progress dialog while it runs.
+        log.info("switch requested for account_id=%s", account_id)
+
+        if self._switch_thread is not None:
+            # A previous switch is still running. Don't start a second.
+            QMessageBox.information(
+                self, "Switch in progress",
+                "Another switch is already running. Please wait for it to finish.",
+            )
+            return
+
         existing = self._find_account(account_id)
-        riot_id = (f"{existing.game_name}#{existing.tag_line}"
-                   if existing else account_id)
+        if existing is None:
+            log.warning("switch: account_id=%s not found", account_id)
+            return
+
+        # main.py guarantees a valid install path is in the vault at startup.
+        # If the file disappeared mid-session (uninstall, drive ejected) the
+        # picker fallback handles it.
+        install_path = self._resolve_install_path()
+        if install_path is None:
+            log.info("switch aborted: no install path available")
+            return
+        riot_id = f"{existing.game_name}#{existing.tag_line}"
+
+        # Progress dialog — modal, no cancel button (cancelling mid-launch is
+        # messy; user can close the Riot Client manually if needed).
+        self._switch_dialog = QProgressDialog(
+            f"Switching to {riot_id}...", "", 0, 0, self
+        )
+        self._switch_dialog.setWindowTitle("Switching account")
+        self._switch_dialog.setCancelButton(None)  # type: ignore[arg-type]
+        self._switch_dialog.setMinimumDuration(0)
+        self._switch_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._switch_dialog.show()
+
+        # Build worker + thread.
+        self._switch_thread = QThread(self)
+        self._switch_worker = SwitchWorker(
+            username=existing.username,
+            password=existing.password,
+            install_path=install_path,
+        )
+        self._switch_worker.moveToThread(self._switch_thread)
+        self._switch_thread.started.connect(self._switch_worker.run)
+        self._switch_worker.progress.connect(self._on_switch_progress)
+        self._switch_worker.finished.connect(self._on_switch_finished)
+        self._switch_worker.failed.connect(self._on_switch_failed)
+        # Both terminal signals stop the thread.
+        self._switch_worker.finished.connect(self._switch_thread.quit)
+        self._switch_worker.failed.connect(self._switch_thread.quit)
+        # When the thread is fully stopped, drop our refs so the next switch can run.
+        self._switch_thread.finished.connect(self._on_switch_thread_finished)
+        self._switch_thread.start()
+
+    def _on_switch_progress(self, msg: str) -> None:
+        log.debug("switch dialog message: %s", msg)
+        if self._switch_dialog is not None:
+            self._switch_dialog.setLabelText(msg)
+
+    def _on_switch_finished(self) -> None:
+        log.info("switch finished successfully")
+        if self._switch_dialog is not None:
+            self._switch_dialog.close()
+            self._switch_dialog = None
+        self.statusBar().showMessage("Logged in.", 5000)
+
+    def _on_switch_failed(self, msg: str) -> None:
+        log.info("switch failed: %s", msg)
+        if self._switch_dialog is not None:
+            self._switch_dialog.close()
+            self._switch_dialog = None
+        QMessageBox.critical(self, "Switch failed", msg)
+
+    def _on_switch_thread_finished(self) -> None:
+        # Final cleanup. Runs after the QThread's event loop has stopped.
+        if self._switch_worker is not None:
+            self._switch_worker.deleteLater()
+            self._switch_worker = None
+        if self._switch_thread is not None:
+            self._switch_thread.deleteLater()
+            self._switch_thread = None
+
+    # ---------- install path (mid-session fallback only) ----------
+    #
+    # main.py runs the full resolve-and-cache flow at startup, so by the time
+    # the main window is open the vault SHOULD have a valid path. These
+    # methods exist for the rare case where the file disappears mid-session
+    # (Riot uninstalled, USB drive ejected, etc.).
+
+    def _resolve_install_path(self) -> Optional[str]:
+        cached = self.vault.get_config(CFG_RIOT_INSTALL_PATH)
+        if cached and Path(cached).exists():
+            return cached
+        if cached:
+            log.info("cached install path %s no longer exists, asking user", cached)
+        return self._prompt_for_install_path()
+
+    def _prompt_for_install_path(self) -> Optional[str]:
         QMessageBox.information(
             self,
-            "Switch (Phase 4)",
-            f"Would launch Riot Client and log in as {riot_id}.\n\n"
-            "Phase 4 will implement this. For now nothing happens.",
+            "Riot Client not found",
+            "The Riot Client was not where we expected.\n\n"
+            "Please point us at RiotClientServices.exe.",
         )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Locate RiotClientServices.exe",
+            "C:/",
+            "RiotClientServices.exe (RiotClientServices.exe)",
+        )
+        if not path:
+            return None
+        self.vault.set_config(CFG_RIOT_INSTALL_PATH, path)
+        return path
 
     def _on_refresh_clicked(self) -> None:
         # Refresh every account's rank. Silent on per-account failures (we

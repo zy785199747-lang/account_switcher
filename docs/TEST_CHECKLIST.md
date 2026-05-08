@@ -160,7 +160,57 @@ Run `.venv\Scripts\python.exe scripts\seed_test_vault.py` to wipe-and-reseed the
 
 ## Phase 4 — Launcher + auto-fill (`v0.4-switch`)
 
-(filled in when Phase 4 starts)
+### Automated
+- [x] All previous tests still pass (54/54)
+- [x] Headless smoke: launcher module imports, send_keys escape works, SwitchWorker constructs, MainWindow holds switch plumbing
+
+### Manual
+**This phase has the highest real-world fragility — UI automation depends on Riot Client's current layout.** Run with `--debug` so you can watch the steps in the console.
+
+**Setup:**
+- League of Legends installed somewhere (anywhere — auto-detect handles it)
+- At least one real account in the vault (use Add Account → Verify, or seed_test_vault.py with real credentials)
+
+**Install-path auto-detection (new, runs at app startup before main window opens):**
+1. **First-run auto-detect**
+   - [ ] Delete vault (or `python -c "from src.storage.vault import Vault, default_vault_path; v=Vault.unlock(default_vault_path(), '<pwd>'); v.set_config('riot_install_path', None); v.save()"`)
+   - [ ] Launch app → unlock → main window opens silently. Log shows "install path via registry: ..."
+2. **Cached path is reused on subsequent launches**
+   - [ ] Relaunch the app → log shows "using cached riot install path: ..."
+3. **File-picker fallback when auto-detect fails**
+   - [ ] Manually set vault `riot_install_path` to `C:\nope\bad.exe` (use the same one-liner as above with a real bad path)
+   - [ ] Launch app → "Locate Riot Client" info dialog → file picker opens → cancel → app exits cleanly
+   - [ ] Launch again → file picker → pick the real RiotClientServices.exe → app proceeds, path saved to vault
+
+1. **Happy path — first switch**
+   - [ ] Close any running Riot Client / League first
+   - [ ] Run `.venv\Scripts\python.exe main.py --debug`
+   - [ ] Click an account card
+   - [ ] Progress dialog appears with messages: "Closing Riot Client...", "Clearing previous session...", "Launching Riot Client...", "Waiting for login window...", "Filling credentials...", "Logged in."
+   - [ ] Riot Client window opens, username + password get auto-typed, Enter pressed, you land on the Riot Client home screen logged in as that account
+
+2. **Switching while already logged in**
+   - [ ] With Riot Client open and logged into account A, click account B in the switcher
+   - [ ] The Riot Client process closes (kill_riot_processes), relaunches, login screen appears, account B's credentials get typed, you land logged in as B
+
+3. **Bad install path**
+   - [ ] In `--admin` or via the vault helper, set `riot_install_path` to a fake path like `C:\nope\nope.exe`
+   - [ ] Click a card → progress dialog briefly opens, then a red error dialog appears: *"Riot Client not found at: C:\nope\nope.exe"*
+   - [ ] App stays running
+
+4. **Riot Client takes too long to show its window**
+   - [ ] Hard to test deterministically. If you see "Riot Client window did not appear within 60s" you'll know.
+
+5. **Concurrent switch requests**
+   - [ ] Click a card → while progress dialog is up, click another card → "Switch in progress" message appears, second click ignored
+
+6. **Special characters in password**
+   - [ ] Add a test account with a password containing `+` `^` `%` `{` `(` (e.g. `Foo{Bar+Baz^`)
+   - [ ] Switch → check that Riot Client's password field receives the literal characters (you can paste-into-notepad to verify if needed)
+
+7. **Logs**
+   - [ ] After a successful switch, `app.log` shows the steps with timestamps: "found N Riot/League processes", "cleared C:\Users\...\RiotClientPrivateSettings.yaml", "launching C:\...", "Riot Client window detected", "credentials sent"
+   - [ ] After a failed switch, the same log shows the failing step
 
 ---
 
