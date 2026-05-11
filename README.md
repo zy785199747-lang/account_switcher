@@ -1,46 +1,34 @@
 # Riot Account Switcher
 
-A Windows desktop app that stores multiple Riot Games accounts encrypted, shows each as a card with current League of Legends rank, and switches between them with one click — no more copy-pasting credentials every time.
+A simple Windows app for managing multiple Riot accounts, checking basic League account info, and switching accounts without copy-pasting credentials by hand.
 
-![Phase status](https://img.shields.io/badge/version-0.5--polish-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Version](https://img.shields.io/badge/version-1.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
-## Features
+## What You Can Do
 
-- **Encrypted vault** — accounts protected by a master password (AES via `cryptography`'s Fernet, PBKDF2-HMAC-SHA256 with 200k iterations)
-- **One-click switch** — closes any running Riot Client, clears the cached session, relaunches, and auto-fills your username and password
-- **Live rank cards** — auto-fetches each account's current solo-queue rank from the Riot API (`account-v1` + `league-v4 by-puuid`)
-- **Stale tags** — ranks more than 24 hours old get a small "(updated 2h ago)" hint; older than 7 days, it turns amber
-- **Auto-detected install path** — finds `RiotClientServices.exe` via the Windows registry, running processes, or a drive scan
-- **Hidden API key** — end users never see or manage the Riot API key. Only the admin (you) configures it via `--admin`
-- **Soft fallback banner** — if the API is down or the key is expired, the UI shows a non-actionable *"Rank info is temporarily unavailable"* message and keeps working with cached data
+- Store Riot accounts in an encrypted vault protected by a master password.
+- Switch accounts from a card with one click/double-click.
+- Choose auto-fill mode: faster clipboard paste or slower typing fallback.
+- View League rank info, including solo/flex rank, LP, profile icon, and stale update hints.
+- Reorder account cards by dragging them, or use the right-click "Move account" fallback.
+- Open an account's op.gg page from the card menu.
+- Configure Riot API key, Riot Client path, default region, and switch confirmation in Settings.
 
 ## Requirements
 
-- Windows 10 / 11
-- Python 3.10 or newer
-- League of Legends + Riot Client installed (anywhere — auto-detected)
+- Windows 10 or 11
+- League of Legends and Riot Client installed
+- No Python needed if you use the release exe
 
 ## Installation
 
-Three options, easiest first.
+### Pre-built exe
 
-### Option 0 — Pre-built .exe (no Python needed)
+Download `RiotAccountSwitcher.exe` from the [Releases page](https://github.com/zy785199747-lang/account_switcher/releases), then double-click it.
 
-Grab the latest `RiotAccountSwitcher.exe` from the [Releases page](https://github.com/zy785199747-lang/account_switcher/releases). Double-click to run. ~46 MB single file, portable, no install required.
+Windows SmartScreen may warn the first time because the exe is not code-signed. Click **More info -> Run anyway** if you trust this build.
 
-> Windows SmartScreen will warn the first time because the .exe isn't code-signed. Click *More info → Run anyway*.
-
-The two source-install options below are for developers or anyone who wants to modify the code.
-
-### Option 1 — uv (recommended for source install)
-
-If you don't have [uv](https://github.com/astral-sh/uv) yet:
-
-```powershell
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-Then:
+### Source install
 
 ```powershell
 git clone https://github.com/zy785199747-lang/account_switcher.git
@@ -50,140 +38,116 @@ uv pip install -r requirements.txt --python .venv\Scripts\python.exe
 .venv\Scripts\python.exe main.py
 ```
 
-### Option 2 — pip with system Python
+If you do not use `uv`, a normal Python virtual environment also works:
 
 ```powershell
-git clone https://github.com/zy785199747-lang/account_switcher.git
-cd account_switcher
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
 ```
 
-## Building the .exe yourself
+## First-Time Setup
 
-If you want to produce your own `RiotAccountSwitcher.exe` from source:
+1. Run the app and create a master password. Pick one you will remember.
+2. The app will try to find Riot Client automatically.
+3. Add your Riot accounts with username, password, Riot ID, region, and optional note.
+4. Optional: add a Riot API key in Settings to enable live rank/profile info.
+
+## How Riot Client Is Found
+
+The app looks for `RiotClientServices.exe` in this order:
+
+1. Saved Riot Client path from your encrypted vault.
+2. Windows registry install records.
+3. Any currently running Riot Client process.
+4. Common install paths on your drives.
+
+If the app cannot find Riot Client, it will ask you to choose `RiotClientServices.exe` manually. You can also change it later in **Settings -> Riot Client path -> Browse**.
+
+## Switching Accounts
+
+Double-click an account card, or right-click and choose **Switch to this account**.
+
+The app will close Riot Client, clear the saved Riot session, relaunch Riot Client, and fill your login. Keep Riot Client focused while auto-fill runs.
+
+## Auto-Fill Modes
+
+In Settings, you can choose:
+
+- **Clipboard paste**: faster and less visibly noisy.
+- **Slow typing fallback**: slower, but sometimes more reliable if Riot Client misses focus.
+
+Clipboard mode restores your previous clipboard after it finishes. If paste mode fails, the app falls back to slow typing.
+
+## If You Forget Your Master Password
+
+There is no password recovery. The vault is encrypted, and the app cannot decrypt it without the correct master password.
+
+To start over:
+
+1. Close the app.
+2. Delete this file:
+
+   `%APPDATA%\RiotAccountSwitcher\vault.enc`
+
+3. Reopen the app.
+4. Create a new master password and add your accounts again.
+
+This deletes all saved accounts, settings, and the Riot API key stored in the vault.
+
+## File Locations
+
+```text
+%APPDATA%\RiotAccountSwitcher\
+  vault.enc       encrypted accounts and settings
+  logs\app.log    rotating app log
+  cache\          profile icon and Data Dragon cache
+```
+
+## Building The Exe
+
+From a source checkout with `.venv` set up:
 
 ```powershell
-# from a checked-out source tree with .venv set up:
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-This installs `pyinstaller` into the venv, runs the bundler with [`RiotAccountSwitcher.spec`](RiotAccountSwitcher.spec), and writes `dist\RiotAccountSwitcher.exe` (~46 MB).
+The build output is:
 
-GitHub Actions also rebuilds on every push to `master` and every tag — see [`.github/workflows/build.yml`](.github/workflows/build.yml). Tag pushes (`git push origin vX.Y`) auto-publish a GitHub Release with the exe attached.
-
-## First-time setup
-
-1. **Set a master password.** First launch shows a "Set Master Password" dialog. There is no recovery — pick something memorable.
-
-2. **(Admin step) Configure the Riot API key** for live rank info:
-   ```powershell
-   .venv\Scripts\python.exe main.py --admin
-   ```
-   Get a free dev key at https://developer.riotgames.com/, paste it into the Admin window, click *Test key* (✓ confirms), Save.
-   Dev keys expire every 24 hours; for a long-lived key, apply for a Personal API key at https://developer.riotgames.com/app-type.
-
-   *The app works fine without an API key — you just won't see ranks on the cards.*
-
-3. **Add your accounts.** From the main window: *Add Account* → fill in your Riot login + Riot ID → *Verify* (if API is up) → *Save*.
-
-4. **Switch.** Click any card → in ~10 seconds you'll be logged into that account. Don't touch the keyboard while it types.
-
-## File locations (all encrypted, never committed)
-
-```
-%APPDATA%\RiotAccountSwitcher\
-├── vault.enc       # encrypted accounts + config
-└── logs\
-    └── app.log     # rotating log (1 MB × 5 files)
+```text
+dist\RiotAccountSwitcher.exe
 ```
 
-## Usage tips
+## Run Tests
 
-- **Edit / Delete an account**: hover its card → ✏️ or 🗑️ in the top-right corner. Right-click also works.
-- **Lock the vault** without exiting: toolbar → *Lock*. Re-prompts for the master password.
-- **Manage API key** (Phase 5+): toolbar → *Settings* → enter or update your Riot API key.
-- **Verbose console logging**: launch with `--debug`.
-- **Inspect/edit vault config** (advanced, deprecated since Phase 5):
-  ```powershell
-  .venv\Scripts\python.exe scripts\vault_admin.py show
-  .venv\Scripts\python.exe scripts\vault_admin.py set <key> <value>
-  .venv\Scripts\python.exe scripts\vault_admin.py clear <key>
-  ```
-- **Run the test suite**: `pytest tests/`
+```powershell
+.venv\Scripts\python.exe -m pytest tests/
+```
+
+If your Windows temp directory has permission issues, use a repo-local temp folder:
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/ --basetemp=.pytest-tmp -p no:cacheprovider
+```
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| "Riot Client not found" | A file picker will appear; point at your real `RiotClientServices.exe` |
-| Auto-fill types into the wrong field | Make sure no other window steals focus during the ~10s switch. Phase 5 will add a clipboard-only fallback |
-| `app.log` shows the password length next to "typing password" | This is a length-only debug line, not the password itself. Use `--debug` only when needed |
-| Forgot master password | Vault is unrecoverable by design. Delete `%APPDATA%\RiotAccountSwitcher\vault.enc` to start over |
-| Rank cards show "Rank not loaded yet" | Either no API key (admin mode) or the key is expired. App still works for switching |
+| Riot Client not found | Choose `RiotClientServices.exe` manually, or set it in Settings. |
+| Auto-fill goes to the wrong field | Keep Riot Client focused while auto-fill runs. Try slow typing mode if clipboard paste is flaky. |
+| Rank info is blank | Add or refresh your Riot API key in Settings. The app still switches accounts without an API key. |
+| Forgot master password | Delete `%APPDATA%\RiotAccountSwitcher\vault.enc` and start over. |
+| Windows warns about the exe | The app is not code-signed; use **More info -> Run anyway** if you trust the release. |
 
-## Project layout
+## Security Notes
 
-```
-account_switcher/
-├── main.py                       # entry point (CLI args + vault unlock + UI dispatch)
-├── requirements.txt
-├── docs/
-│   └── TEST_CHECKLIST.md         # per-phase manual test items
-├── scripts/
-│   ├── seed_test_vault.py        # populate a throwaway vault for UI testing
-│   └── vault_admin.py            # CLI to read/write vault config
-├── assets/
-│   └── ranks/                    # Rank tier icon images (11 tiers + unranked)
-├── src/
-│   ├── models.py                 # Account dataclass
-│   ├── logging_setup.py          # rotating-file logger + --debug
-│   ├── external_links.py         # op.gg URL builder
-│   ├── storage/
-│   │   ├── crypto.py             # PBKDF2 + Fernet
-│   │   └── vault.py              # encrypted JSON CRUD
-│   ├── riot/
-│   │   ├── api.py                # Riot Web API client + caching
-│   │   ├── launcher.py           # process kill, session clear, launch, auto-fill
-│   │   └── ddragon.py            # DDragon image URLs for rank icons
-│   └── ui/
-│       ├── master_password.py    # set + unlock dialogs
-│       ├── main_window.py        # toolbar + card grid + banner
-│       ├── account_card.py       # per-account card (hover edit/delete icons)
-│       ├── add_account_dialog.py # add/edit form with Verify
-│       ├── settings_dialog.py    # API key management + settings
-│       ├── reorder_dialog.py     # reorder accounts drag-drop dialog
-│       ├── admin_window.py       # API key management (--admin only)
-│       ├── profile_icon.py       # profile icon rendering
-│       ├── rank_icon.py          # rank tier icon rendering
-│       └── switch_worker.py      # QThread worker for the switch flow
-└── tests/                         # 59 unit + smoke tests
-```
-
-## Development status
-
-This is a personal-use tool that grew up in phases. Each phase has a git tag and is independently runnable:
-
-| Tag | Phase |
-|---|---|
-| `v0.1-vault` | Encrypted vault + master password |
-| `v0.2-crud` | Account cards UI |
-| `v0.3-api` | Riot API integration + admin window + banner |
-| `v0.4-switch` | Riot Client launch + credential auto-fill |
-| `v0.5-polish` | **Current** — Settings dialog, rank/profile icons, reorder, polish |
-| (planned) | Phase 6: Documentation |
-
-If you ever break `master`, the previous tag is your rollback point: `git checkout v0.3-api`.
-
-## Security notes
-
-- Account credentials and the Riot API key live only in the encrypted vault under `%APPDATA%`. Nothing is written to disk in plaintext, ever.
-- The `.gitignore` excludes `*.enc`, `*.key`, `*.token`, and the logs directory so secrets can't accidentally be committed.
-- The master password derives the encryption key with PBKDF2-HMAC-SHA256 at 200,000 iterations — slow on purpose to make brute force expensive.
-- Auto-fill works by sending Win32 keystrokes to whichever window has focus once the Riot Client login window appears. Don't move focus during the ~10-second switch or your password may end up in the wrong app.
+- Account credentials and the Riot API key are stored in the encrypted vault under `%APPDATA%`.
+- The master password derives the encryption key with PBKDF2-HMAC-SHA256.
+- There is no recovery path for a forgotten master password.
+- Auto-fill works by focusing Riot Client and sending paste/keystroke input. Do not change focus while it runs.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
