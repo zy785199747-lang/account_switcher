@@ -23,6 +23,7 @@
 
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -50,8 +51,12 @@ except ImportError:  # pragma: no cover
 # winreg is Windows-only (Python stdlib). Wrap so the module imports on Linux
 # during pytest runs.
 if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
     import winreg  # type: ignore[import-not-found]
 else:  # pragma: no cover
+    ctypes = None  # type: ignore[assignment]
+    wintypes = None  # type: ignore[assignment]
     winreg = None  # type: ignore[assignment]
 
 # ---------- tweakable constants ----------
@@ -82,17 +87,23 @@ RIOT_WINDOW_TITLE_REGEX = "Riot Client.*"
 # Time budgets.
 KILL_WAIT_SECONDS = 5.0      # how long to wait for processes to actually exit
 WINDOW_WAIT_SECONDS = 60.0   # how long we'll wait for the login window
-WINDOW_POLL_INTERVAL = 0.25
+WINDOW_POLL_INTERVAL = 0.10
+USERNAME_VERIFY_TIMEOUT_SECONDS = 6.0
+USERNAME_VERIFY_RETRY_SECONDS = 0.15
 FOCUS_SETTLE_SECONDS = 0.6   # let the field be ready after set_focus
 KEY_PAUSE_SECONDS = 0.03     # delay between keystrokes (avoids dropped chars)
 CLIPBOARD_RETRY_COUNT = 8
 CLIPBOARD_RETRY_SECONDS = 0.04
+TYPE_FOCUS_SETTLE_SECONDS = 0.20
+TYPE_FIELD_SETTLE_SECONDS = 0.10
+TYPE_SUBMIT_SETTLE_SECONDS = 0.05
 PASTE_FOCUS_SETTLE_SECONDS = 0.05
 CLIPBOARD_SETTLE_SECONDS = 0.02
-PASTE_SETTLE_SECONDS = 0.04
-PASTE_TAB_SETTLE_SECONDS = 0.18
-FOCUS_RETRY_SECONDS = 6.0
-FOCUS_RETRY_INTERVAL = 0.2
+PASTE_SETTLE_SECONDS = 0.02
+PASTE_TAB_SETTLE_SECONDS = 0.08
+FOCUS_RETRY_SECONDS = 2.0
+FOCUS_RETRY_INTERVAL = 0.05
+PYWINAUTO_FOCUS_FALLBACK_SECONDS = 0.75
 
 AUTO_FILL_CLIPBOARD = "clipboard"
 AUTO_FILL_TYPING = "typing"
@@ -373,12 +384,15 @@ def wait_for_login_window_fast(timeout: float = WINDOW_WAIT_SECONDS):
     deadline = time.monotonic() + timeout
     last_err: Optional[Exception] = None
     while time.monotonic() < deadline:
+        window = _visible_riot_native_window()
+        if window is not None:
+            log.info("Riot Client window detected via native")
+            return window
+
         for backend in ("win32", "uia"):
             try:
-                window = pwa_desktop(backend=backend).window(
-                    title_re=RIOT_WINDOW_TITLE_REGEX
-                )
-                if window.exists(timeout=0) and window.is_visible():
+                window = _last_visible_riot_window(backend)
+                if window is not None:
                     log.info("Riot Client window detected via %s", backend)
                     return window
             except Exception as exc:
@@ -395,15 +409,127 @@ def _iter_riot_windows():
     # Yield fresh wrappers each time. Riot Client can briefly expose a native
     # window whose handle goes stale while CEF finishes booting; re-querying
     # avoids pasting into nowhere after an invalid-handle focus failure.
+    window = _visible_riot_native_window()
+    if window is not None:
+        yield "native", window
+
+    yield from _iter_pywinauto_riot_windows()
+
+
+def _iter_pywinauto_riot_windows():
+    # Slower pywinauto fallbacks. Kept separate so focusing can try native
+    # handles first without accidentally blocking on UIA wrapper creation.
+
     for backend in ("win32", "uia"):
+        window = _last_visible_riot_window(backend)
+        if window is not None:
+            yield backend, window
+
+
+class _NativeWindow:
+    def __init__(self, hwnd: int):
+        self.handle = hwnd
+        self._hwnd = hwnd
+
+    def exists(self, timeout=0):
+        return _is_window_visible(self.handle)
+
+    def is_visible(self):
+        return _is_window_visible(self.handle)
+
+    def set_focus(self):
+        if not _focus_window_native(self):
+            raise RuntimeError(f"native focus failed for hwnd={self.handle}")
+
+
+def _is_window_visible(hwnd: int) -> bool:
+    if sys.platform != "win32" or ctypes is None:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+            return False
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        return width >= 300 and height >= 200
+    except Exception:
+        return False
+
+
+def _visible_riot_native_window():
+    if sys.platform != "win32" or ctypes is None or wintypes is None:
+        return None
+
+    user32 = ctypes.windll.user32
+    title_re = re.compile(RIOT_WINDOW_TITLE_REGEX)
+    matches: list[int] = []
+
+    enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def enum_proc(hwnd, _lparam):
         try:
-            window = pwa_desktop(backend=backend).window(
-                title_re=RIOT_WINDOW_TITLE_REGEX
-            )
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            title = ""
+            if length > 0:
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buffer, length + 1)
+                title = buffer.value
+            if title_re.match(title):
+                matches.append(int(hwnd))
+        except Exception:
+            return True
+        return True
+
+    try:
+        user32.EnumWindows(enum_proc_type(enum_proc), 0)
+    except Exception as exc:
+        log.debug("native Riot window enumeration failed: %s", exc)
+        return None
+
+    for hwnd in reversed(matches):
+        if _is_window_visible(hwnd):
+            return _NativeWindow(hwnd)
+    return None
+
+
+def _last_visible_riot_window(backend: str):
+    # Riot can briefly keep a bootstrap window around while the real CEF login
+    # window appears. Prefer the newest visible candidate to avoid spending the
+    # focus retry budget on an old handle.
+    try:
+        windows = pwa_desktop(backend=backend).windows(
+            title_re=RIOT_WINDOW_TITLE_REGEX,
+            visible_only=True,
+            enabled_only=False,
+        )
+    except Exception as exc:
+        log.debug("listing Riot windows via %s failed: %s", backend, exc)
+        return _visible_riot_window_probe(backend)
+
+    for window in reversed(windows):
+        try:
             if window.exists(timeout=0) and window.is_visible():
-                yield backend, window
+                return window
         except Exception as exc:
-            log.debug("window probe via %s failed: %s", backend, exc)
+            log.debug("visible Riot candidate via %s was stale: %s", backend, exc)
+    return _visible_riot_window_probe(backend)
+
+
+def _visible_riot_window_probe(backend: str):
+    try:
+        window = pwa_desktop(backend=backend).window(
+            title_re=RIOT_WINDOW_TITLE_REGEX
+        )
+        if window.exists(timeout=0) and window.is_visible():
+            return window
+    except Exception as exc:
+        log.debug("window probe via %s failed: %s", backend, exc)
+    return None
 
 
 def focus_riot_window(initial_window=None,
@@ -412,37 +538,47 @@ def focus_riot_window(initial_window=None,
     # Returning a focused, freshly-valid wrapper is better than continuing
     # after set_focus() fails and pretending the login worked.
     deadline = time.monotonic() + timeout
+    pywinauto_fallback_at = time.monotonic() + PYWINAUTO_FOCUS_FALLBACK_SECONDS
     last_err: Optional[Exception] = None
 
-    candidates = []
-    if initial_window is not None:
-        candidates.append(("initial", initial_window))
-
     while time.monotonic() < deadline:
-        for backend, window in candidates + list(_iter_riot_windows()):
-            try:
-                window.set_focus()
-                log.info("Riot Client window focused via %s", backend)
-                return window
-            except RuntimeError as exc:
-                # Some pywinauto wrappers raise when a title query matches
-                # both the bootstrap Riot window and the real login window.
-                # Pick the last visible candidate and focus that explicitly.
-                if "There are 2 elements" in str(exc):
-                    focused = _focus_last_matching_window(backend)
-                    if focused is not None:
-                        return focused
-                    last_err = exc
-                    log.debug("ambiguous focus via %s had no usable candidate: %s",
-                              backend, exc)
-                    continue
-                last_err = exc
-                log.debug("set_focus failed via %s: %s", backend, exc)
-            except Exception as exc:
-                last_err = exc
-                log.debug("set_focus failed via %s: %s", backend, exc)
+        if initial_window is not None:
+            if _focus_window_native(initial_window):
+                log.info("Riot Client window focused via detected native")
+                return initial_window
 
-        candidates = []
+        native_window = _visible_riot_native_window()
+        if native_window is not None and _focus_window_native(native_window):
+            log.info("Riot Client window focused via native")
+            return native_window
+
+        if time.monotonic() >= pywinauto_fallback_at:
+            for backend, window in _iter_pywinauto_riot_windows():
+                if _focus_window_native(window):
+                    log.info("Riot Client window focused via %s native", backend)
+                    return window
+                try:
+                    window.set_focus()
+                    log.info("Riot Client window focused via %s", backend)
+                    return window
+                except RuntimeError as exc:
+                    # Some pywinauto wrappers raise when a title query matches
+                    # both the bootstrap Riot window and the real login window.
+                    # Pick the last visible candidate and focus that explicitly.
+                    if "There are 2 elements" in str(exc):
+                        focused = _focus_last_matching_window(backend)
+                        if focused is not None:
+                            return focused
+                        last_err = exc
+                        log.debug("ambiguous focus via %s had no usable candidate: %s",
+                                  backend, exc)
+                        continue
+                    last_err = exc
+                    log.debug("set_focus failed via %s: %s", backend, exc)
+                except Exception as exc:
+                    last_err = exc
+                    log.debug("set_focus failed via %s: %s", backend, exc)
+
         time.sleep(FOCUS_RETRY_INTERVAL)
 
     raise RiotWindowNotFound(
@@ -452,24 +588,127 @@ def focus_riot_window(initial_window=None,
 
 
 def _focus_last_matching_window(backend: str):
+    window = _last_visible_riot_window(backend)
+    if window is None:
+        return None
     try:
-        windows = pwa_desktop(backend=backend).windows(
-            title_re=RIOT_WINDOW_TITLE_REGEX,
-            visible_only=True,
-            enabled_only=False,
-        )
+        window.set_focus()
+        log.info("Riot Client window focused via %s candidate", backend)
+        return window
     except Exception as exc:
-        log.debug("listing Riot windows via %s failed: %s", backend, exc)
+        log.debug("candidate focus via %s failed: %s", backend, exc)
+    return None
+
+
+def _window_handle(window) -> Optional[int]:
+    if window is None:
         return None
 
-    for window in reversed(windows):
+    direct_handle = getattr(window, "_hwnd", None)
+    if direct_handle:
         try:
-            window.set_focus()
-            log.info("Riot Client window focused via %s candidate", backend)
-            return window
-        except Exception as exc:
-            log.debug("candidate focus via %s failed: %s", backend, exc)
-    return None
+            return int(direct_handle)
+        except (TypeError, ValueError):
+            pass
+
+    owners = [window]
+    try:
+        element_info = getattr(window, "element_info", None)
+    except Exception as exc:
+        log.debug("could not resolve window element_info for handle: %s", exc)
+        element_info = None
+    if element_info is not None:
+        owners.append(element_info)
+
+    for owner in owners:
+        if owner is None:
+            continue
+        handle = getattr(owner, "handle", None)
+        if callable(handle):
+            try:
+                handle = handle()
+            except Exception:
+                handle = None
+        if handle:
+            try:
+                return int(handle)
+            except (TypeError, ValueError):
+                pass
+
+    try:
+        wrapper = window.wrapper_object()
+    except Exception as exc:
+        log.debug("could not resolve window wrapper for handle: %s", exc)
+        return None
+
+    handle = getattr(wrapper, "handle", None)
+    if callable(handle):
+        try:
+            handle = handle()
+        except Exception:
+            return None
+    if not handle:
+        return None
+    try:
+        return int(handle)
+    except (TypeError, ValueError):
+        return None
+
+
+def _focus_window_native(window) -> bool:
+    if sys.platform != "win32" or ctypes is None:
+        return False
+
+    hwnd = _window_handle(window)
+    if not hwnd:
+        return False
+
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        show_cmd = 9 if user32.IsIconic(hwnd) else 5  # SW_RESTORE / SW_SHOW
+        try:
+            user32.ShowWindowAsync(hwnd, show_cmd)
+        except Exception:
+            user32.ShowWindow(hwnd, show_cmd)
+
+        current_thread = kernel32.GetCurrentThreadId()
+        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+        foreground_hwnd = user32.GetForegroundWindow()
+        foreground_thread = (
+            user32.GetWindowThreadProcessId(foreground_hwnd, None)
+            if foreground_hwnd else 0
+        )
+
+        attached_target = False
+        attached_foreground = False
+        if target_thread and target_thread != current_thread:
+            attached_target = bool(user32.AttachThreadInput(
+                current_thread,
+                target_thread,
+                True,
+            ))
+        if foreground_thread and foreground_thread != current_thread:
+            attached_foreground = bool(user32.AttachThreadInput(
+                current_thread,
+                foreground_thread,
+                True,
+            ))
+
+        try:
+            user32.BringWindowToTop(hwnd)
+            focused = bool(user32.SetForegroundWindow(hwnd))
+            user32.SetFocus(hwnd)
+            time.sleep(0.01)
+            return focused or user32.GetForegroundWindow() == hwnd
+        finally:
+            if attached_foreground:
+                user32.AttachThreadInput(current_thread, foreground_thread, False)
+            if attached_target:
+                user32.AttachThreadInput(current_thread, target_thread, False)
+    except Exception as exc:
+        log.debug("native focus failed for hwnd=%s: %s", hwnd, exc)
+        return False
 
 
 # ---------- keystroke helpers ----------
@@ -500,8 +739,7 @@ def type_credentials(window, username: str, password: str) -> None:
     log.info("focusing Riot Client window")
     window = focus_riot_window(window)
 
-    # Wait for the page to fully render and form to be interactive
-    time.sleep(1.5)
+    time.sleep(TYPE_FOCUS_SETTLE_SECONDS)
 
     # Type username. Assume the username field is focused (Riot Client opens with it focused).
     log.info("typing username (length=%d)", len(username))
@@ -510,12 +748,12 @@ def type_credentials(window, username: str, password: str) -> None:
     pwa_keyboard.send_keys(escaped_username,
                            with_spaces=True, pause=0.08)
     log.info("username sent to focused field")
-    time.sleep(0.5)
+    time.sleep(TYPE_FIELD_SETTLE_SECONDS)
 
     # Tab to password field
     log.info("tabbing to password field")
     pwa_keyboard.send_keys("{TAB}", pause=0.08)
-    time.sleep(0.5)
+    time.sleep(TYPE_FIELD_SETTLE_SECONDS)
 
     # Type password
     log.info("typing password (length=%d)", len(password))
@@ -524,7 +762,7 @@ def type_credentials(window, username: str, password: str) -> None:
     pwa_keyboard.send_keys(escaped_password,
                            with_spaces=True, pause=0.08)
     log.info("password sent to focused field")
-    time.sleep(0.3)
+    time.sleep(TYPE_SUBMIT_SETTLE_SECONDS)
 
     # Submit
     pwa_keyboard.send_keys("{ENTER}", pause=0.08)
@@ -566,8 +804,39 @@ def _set_clipboard_text(text: str) -> None:
 def _paste_text(text: str) -> None:
     _set_clipboard_text(text)
     time.sleep(CLIPBOARD_SETTLE_SECONDS)
-    pwa_keyboard.send_keys("^v", pause=0.05, vk_packet=False)
+    pwa_keyboard.send_keys("^v", pause=0.01, vk_packet=False)
     time.sleep(PASTE_SETTLE_SECONDS)
+
+
+def _focused_text_equals(expected: str) -> bool:
+    sentinel = "__RAS_VERIFY_CLIPBOARD_SENTINEL__"
+    _set_clipboard_text(sentinel)
+    pwa_keyboard.send_keys("^a", pause=0.01, vk_packet=False)
+    time.sleep(PASTE_SETTLE_SECONDS)
+    pwa_keyboard.send_keys("^c", pause=0.01, vk_packet=False)
+    time.sleep(PASTE_SETTLE_SECONDS)
+    return _clipboard_text() == expected
+
+
+def _paste_username_verified(username: str) -> None:
+    # This is the important readiness check. Window stability and focus are
+    # only proxies; confirming that Ctrl+A/C reads back the username proves
+    # the focused control is the username field and that paste actually landed.
+    deadline = time.monotonic() + USERNAME_VERIFY_TIMEOUT_SECONDS
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        pwa_keyboard.send_keys("^a{DELETE}", pause=0.01)
+        _paste_text(username)
+        if _focused_text_equals(username):
+            log.info("username paste verified on attempt %d", attempt)
+            return
+
+        log.debug("username paste verification failed on attempt %d", attempt)
+        pwa_keyboard.send_keys("{TAB}", pause=0.01)
+        time.sleep(USERNAME_VERIFY_RETRY_SECONDS)
+
+    raise LauncherError("username field did not accept clipboard paste")
 
 
 def paste_credentials(window, username: str, password: str) -> None:
@@ -584,18 +853,17 @@ def paste_credentials(window, username: str, password: str) -> None:
     original_clipboard = _clipboard_text()
     try:
         log.info("pasting username (length=%d)", len(username))
-        pwa_keyboard.send_keys("^a{DELETE}", pause=0.05)
-        _paste_text(username)
+        _paste_username_verified(username)
 
         log.info("tabbing to password field")
-        pwa_keyboard.send_keys("{TAB}", pause=0.05)
+        pwa_keyboard.send_keys("{TAB}", pause=0.01)
         time.sleep(PASTE_TAB_SETTLE_SECONDS)
 
         log.info("pasting password (length=%d)", len(password))
-        pwa_keyboard.send_keys("^a{DELETE}", pause=0.05)
+        pwa_keyboard.send_keys("^a{DELETE}", pause=0.01)
         _paste_text(password)
 
-        pwa_keyboard.send_keys("{ENTER}", pause=0.05)
+        pwa_keyboard.send_keys("{ENTER}", pause=0.01)
         log.info("credentials pasted")
     finally:
         try:

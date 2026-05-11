@@ -2,7 +2,7 @@
 
 A simple Windows app for managing multiple Riot accounts, checking basic League account info, and switching accounts without copy-pasting credentials by hand.
 
-![Version](https://img.shields.io/badge/version-1.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
 ## What You Can Do
 
@@ -13,6 +13,7 @@ A simple Windows app for managing multiple Riot accounts, checking basic League 
 - Reorder account cards by dragging them, or use the right-click "Move account" fallback.
 - Open an account's op.gg page from the card menu.
 - Configure Riot API key, Riot Client path, default region, and switch confirmation in Settings.
+- Check for app updates from the toolbar; packaged releases can download and install updates in-app.
 
 ## Requirements
 
@@ -27,6 +28,16 @@ A simple Windows app for managing multiple Riot accounts, checking basic League 
 Download `RiotAccountSwitcher.exe` from the [Releases page](https://github.com/zy785199747-lang/account_switcher/releases), then double-click it.
 
 Windows SmartScreen may warn the first time because the exe is not code-signed. Click **More info -> Run anyway** if you trust this build.
+
+## Updates
+
+The app checks GitHub Releases after it starts.
+
+You can also click **Check Updates** in the toolbar.
+
+If you use the packaged `RiotAccountSwitcher.exe`, the app can download the new exe, replace the old one, and restart.
+
+If you run from source, the app opens the latest release page instead.
 
 ### Source install
 

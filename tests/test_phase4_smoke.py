@@ -2,9 +2,19 @@
 
 import pytest
 from src.riot.launcher import (
+    FOCUS_RETRY_SECONDS,
+    FOCUS_RETRY_INTERVAL,
+    TYPE_FIELD_SETTLE_SECONDS,
+    TYPE_FOCUS_SETTLE_SECONDS,
+    TYPE_SUBMIT_SETTLE_SECONDS,
+    PYWINAUTO_FOCUS_FALLBACK_SECONDS,
+    USERNAME_VERIFY_RETRY_SECONDS,
+    USERNAME_VERIFY_TIMEOUT_SECONDS,
     _escape_for_send_keys,
+    _last_visible_riot_window,
     find_riot_processes,
     RIOT_PROCESS_NAMES,
+    WINDOW_POLL_INTERVAL,
 )
 from src.ui.switch_worker import SwitchWorker
 
@@ -41,6 +51,66 @@ def test_send_keys_escape():
     assert _escape_for_send_keys("a)b") == "a{)}b"
     # Complex: { + ^ % ~ [ ] ( )
     assert _escape_for_send_keys("test{+^%~[]()") == "test{{}{+}{^}{%}{~}{[}{]}{(}{)}"
+
+
+class _FakeWindow:
+    def __init__(self, visible=True, exists=True):
+        self._visible = visible
+        self._exists = exists
+
+    def exists(self, timeout=0):
+        return self._exists
+
+    def is_visible(self):
+        return self._visible
+
+
+class _FakeDesktop:
+    def __init__(self, windows, fallback_window=None):
+        self._windows = windows
+        self._fallback_window = fallback_window
+
+    def windows(self, **_kwargs):
+        return self._windows
+
+    def window(self, **_kwargs):
+        return self._fallback_window
+
+
+def test_last_visible_riot_window_prefers_newest_visible(monkeypatch):
+    old_window = _FakeWindow(visible=True)
+    hidden_window = _FakeWindow(visible=False)
+    newest_window = _FakeWindow(visible=True)
+
+    monkeypatch.setattr(
+        "src.riot.launcher.pwa_desktop",
+        lambda backend: _FakeDesktop([old_window, hidden_window, newest_window]),
+    )
+
+    assert _last_visible_riot_window("win32") is newest_window
+
+
+def test_last_visible_riot_window_falls_back_to_direct_probe(monkeypatch):
+    fallback_window = _FakeWindow(visible=True)
+
+    monkeypatch.setattr(
+        "src.riot.launcher.pwa_desktop",
+        lambda backend: _FakeDesktop([], fallback_window),
+    )
+
+    assert _last_visible_riot_window("win32") is fallback_window
+
+
+def test_autofill_focus_timing_is_not_six_second_pause():
+    assert WINDOW_POLL_INTERVAL <= 0.10
+    assert FOCUS_RETRY_INTERVAL <= 0.05
+    assert FOCUS_RETRY_SECONDS <= 2.0
+    assert TYPE_FOCUS_SETTLE_SECONDS <= 0.20
+    assert TYPE_FIELD_SETTLE_SECONDS <= 0.10
+    assert TYPE_SUBMIT_SETTLE_SECONDS <= 0.05
+    assert PYWINAUTO_FOCUS_FALLBACK_SECONDS <= 0.75
+    assert USERNAME_VERIFY_RETRY_SECONDS <= 0.15
+    assert USERNAME_VERIFY_TIMEOUT_SECONDS <= 6.0
 
 
 def test_switch_worker_constructs():

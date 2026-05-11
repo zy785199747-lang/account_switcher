@@ -42,6 +42,7 @@ from src.storage.vault import (
 from src.ui.admin_window import AdminWindow
 from src.ui.main_window import MainWindow
 from src.ui.master_password import prompt_set_password, prompt_unlock
+from src.version import APP_VERSION
 
 # Same vault key MainWindow uses. Kept in sync manually for now (a future
 # config module could centralise these constants).
@@ -188,6 +189,7 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("Riot Account Switcher")
+    app.setApplicationVersion(APP_VERSION)
 
     vault = acquire_vault(app)
     if vault is None:

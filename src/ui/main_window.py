@@ -18,8 +18,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QEvent, QPoint, Qt, QThread, QTimer
-from PyQt6.QtGui import QAction
+from PyQt6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, QUrl
+from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -63,6 +63,13 @@ from src.ui.add_account_dialog import AddAccountDialog, VerifyResult
 from src.ui.reorder_dialog import ReorderDialog
 from src.ui.settings_dialog import SettingsDialog
 from src.ui.switch_worker import SwitchWorker
+from src.ui.update_worker import UpdateWorker
+from src.updater import (
+    RELEASES_URL,
+    format_update_summary,
+    install_downloaded_update,
+    running_from_frozen_exe,
+)
 
 # Vault config keys (kept consistent with admin_window.py and settings_dialog.py).
 CFG_API_KEY = "riot_api_key"
@@ -116,6 +123,9 @@ class MainWindow(QMainWindow):
         self._switch_thread: Optional[QThread] = None
         self._switch_worker: Optional[SwitchWorker] = None
         self._switch_dialog: Optional[QProgressDialog] = None
+        self._update_thread: Optional[QThread] = None
+        self._update_worker: Optional[UpdateWorker] = None
+        self._update_manual = False
 
         # Manual card-drag visuals. The layout order only changes on release;
         # during drag, a pixmap ghost follows the cursor and the source card
@@ -138,6 +148,7 @@ class MainWindow(QMainWindow):
         # 1h cache TTL, so subsequent launches don't hammer the API and the
         # user gets an instant window. Only stale rows actually hit the network.
         QTimer.singleShot(150, self._refresh_on_launch)
+        QTimer.singleShot(1500, self._check_for_updates_silent)
 
     # ---------- layout ----------
 
@@ -157,6 +168,10 @@ class MainWindow(QMainWindow):
         settings_act = QAction("Settings", self)
         settings_act.triggered.connect(self._on_settings_clicked)
         tb.addAction(settings_act)
+
+        update_act = QAction("Check Updates", self)
+        update_act.triggered.connect(self._on_check_updates_clicked)
+        tb.addAction(update_act)
 
         tb.addSeparator()
 
@@ -631,6 +646,25 @@ class MainWindow(QMainWindow):
             self._switch_thread.deleteLater()
             self._switch_thread = None
 
+    def closeEvent(self, event) -> None:
+        if self._switch_thread is not None and self._switch_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Switch in progress",
+                "Account switching is still running. Please wait for it to finish.",
+            )
+            event.ignore()
+            return
+        if self._update_thread is not None and self._update_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Update in progress",
+                "An update check or download is still running. Please wait for it to finish.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     # ---------- install path (mid-session fallback only) ----------
     #
     # main.py runs the full resolve-and-cache flow at startup, so by the time
@@ -817,6 +851,141 @@ class MainWindow(QMainWindow):
             return
         # Reload API client in case the key changed
         self._reload_api_client()
+
+    def _check_for_updates_silent(self) -> None:
+        if self._update_thread is not None:
+            return
+        self._start_update_check(manual=False)
+
+    def _on_check_updates_clicked(self) -> None:
+        self._start_update_check(manual=True)
+
+    def _start_update_check(self, manual: bool) -> None:
+        if self._update_thread is not None:
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "Update check",
+                    "An update check is already running.",
+                )
+            return
+
+        log.info("update check started (manual=%s)", manual)
+        self._update_manual = manual
+        if manual:
+            self.statusBar().showMessage("Checking for updates...", 5000)
+
+        self._update_thread = QThread(self)
+        self._update_worker = UpdateWorker(download=False)
+        self._update_worker.moveToThread(self._update_thread)
+        self._update_thread.started.connect(self._update_worker.run)
+        self._update_worker.update_available.connect(self._on_update_available)
+        self._update_worker.no_update.connect(self._on_no_update_available)
+        self._update_worker.failed.connect(self._on_update_failed)
+        self._update_worker.finished.connect(self._update_thread.quit)
+        self._update_thread.finished.connect(self._on_update_thread_finished)
+        self._update_thread.start()
+
+    def _on_update_available(self, info) -> None:
+        log.info("update available: %s", info.latest_version)
+        body = format_update_summary(info)
+        if running_from_frozen_exe():
+            body += "\n\nDownload and install it now? The app will restart."
+            reply = QMessageBox.question(
+                self,
+                "Update available",
+                body,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._start_update_download(info)
+            return
+
+        body += "\n\nAuto-install is only available in the packaged exe."
+        body += "\nOpen the release page?"
+        reply = QMessageBox.question(
+            self,
+            "Update available",
+            body,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl(info.release_url or RELEASES_URL))
+
+    def _on_no_update_available(self) -> None:
+        log.info("no update available")
+        if self._update_manual:
+            QMessageBox.information(
+                self,
+                "No update available",
+                "You are already on the latest version.",
+            )
+
+    def _on_update_failed(self, msg: str) -> None:
+        log.info("update check failed: %s", msg)
+        if self._update_manual:
+            QMessageBox.warning(
+                self,
+                "Update check failed",
+                msg,
+            )
+
+    def _start_update_download(self, info) -> None:
+        if self._update_thread is not None:
+            self._update_thread.quit()
+            self._update_thread.wait(1000)
+            self._on_update_thread_finished()
+
+        log.info("update download started: %s", info.latest_version)
+        self.statusBar().showMessage("Downloading update...", 5000)
+        self._update_manual = True
+        self._update_thread = QThread(self)
+        self._update_worker = UpdateWorker(download=True, info=info)
+        self._update_worker.moveToThread(self._update_thread)
+        self._update_thread.started.connect(self._update_worker.run)
+        self._update_worker.downloaded.connect(self._on_update_downloaded)
+        self._update_worker.failed.connect(self._on_update_failed)
+        self._update_worker.finished.connect(self._update_thread.quit)
+        self._update_thread.finished.connect(self._on_update_thread_finished)
+        self._update_thread.start()
+
+    def _on_update_downloaded(self, info, path) -> None:
+        log.info("update downloaded: %s", path)
+        try:
+            install_downloaded_update(path)
+        except Exception as exc:
+            log.warning("auto-install failed: %s", exc)
+            QMessageBox.information(
+                self,
+                "Update downloaded",
+                f"Downloaded {info.asset_name}.\n\n"
+                f"Auto-install failed:\n{exc}\n\n"
+                "Opening the release page instead.",
+            )
+            QDesktopServices.openUrl(QUrl(info.release_url or RELEASES_URL))
+            return
+
+        if self._update_thread is not None:
+            self._update_thread.quit()
+            self._update_thread.wait(1000)
+            self._on_update_thread_finished()
+
+        QMessageBox.information(
+            self,
+            "Update ready",
+            "The update will install after the app closes. The app will restart.",
+        )
+        QApplication.quit()
+
+    def _on_update_thread_finished(self) -> None:
+        if self._update_worker is not None:
+            self._update_worker.deleteLater()
+            self._update_worker = None
+        if self._update_thread is not None:
+            self._update_thread.deleteLater()
+            self._update_thread = None
 
     def _on_lock_clicked(self) -> None:
         log.info("lock clicked")
