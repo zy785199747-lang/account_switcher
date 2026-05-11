@@ -495,15 +495,23 @@ class AccountCard(QFrame):
         )
         menu.addAction(switch_act)
 
+        refresh_act = QAction("Refresh rank", self)
+        refresh_act.triggered.connect(
+            lambda: self.refresh_requested.emit(self.account.id)
+        )
+        menu.addAction(refresh_act)
+
+        opgg_act = QAction("Open op.gg page", self)
+        opgg_act.triggered.connect(self._open_opgg)
+        menu.addAction(opgg_act)
+
         menu.addSeparator()
 
-        reorder_act = QAction("Reorder accounts", self)
+        reorder_act = QAction("Move account", self)
         reorder_act.triggered.connect(
             lambda: self.move_requested.emit(self.account.id, "reorder")
         )
         menu.addAction(reorder_act)
-
-        menu.addSeparator()
 
         edit_act = QAction("Edit", self)
         edit_act.triggered.connect(
@@ -516,20 +524,6 @@ class AccountCard(QFrame):
             lambda: self.delete_requested.emit(self.account.id)
         )
         menu.addAction(delete_act)
-
-        menu.addSeparator()
-
-        refresh_act = QAction("Refresh rank", self)
-        refresh_act.triggered.connect(
-            lambda: self.refresh_requested.emit(self.account.id)
-        )
-        menu.addAction(refresh_act)
-
-        menu.addSeparator()
-
-        opgg_act = QAction("Open op.gg page", self)
-        opgg_act.triggered.connect(self._open_opgg)
-        menu.addAction(opgg_act)
 
         menu.exec(global_pos)
 

@@ -21,6 +21,7 @@ import logging
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from src.riot.launcher import (
+    AUTO_FILL_CLIPBOARD,
     LauncherError,
     switch_account,
 )
@@ -36,11 +37,13 @@ class SwitchWorker(QObject):
     # Emitted on any failure with a human-friendly message.
     failed = pyqtSignal(str)
 
-    def __init__(self, username: str, password: str, install_path: str):
+    def __init__(self, username: str, password: str, install_path: str,
+                 auto_fill_mode: str = AUTO_FILL_CLIPBOARD):
         super().__init__()
         self._username = username
         self._password = password
         self._install_path = install_path
+        self._auto_fill_mode = auto_fill_mode
 
     def run(self) -> None:
         # Runs on the worker thread. Never throw — convert all exceptions to
@@ -50,6 +53,7 @@ class SwitchWorker(QObject):
                 username=self._username,
                 password=self._password,
                 install_path=self._install_path,
+                auto_fill_mode=self._auto_fill_mode,
                 progress=self._emit_progress,
             )
             self.finished.emit()

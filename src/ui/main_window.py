@@ -53,6 +53,7 @@ from src.riot.ddragon import (
 )
 from src.ui.profile_icon import clear_cache as clear_profile_icon_pixmap_cache
 from src.riot.launcher import (
+    AUTO_FILL_CLIPBOARD,
     DEFAULT_RIOT_INSTALL_PATH,
     find_riot_install_path,
 )
@@ -68,6 +69,7 @@ CFG_API_KEY = "riot_api_key"
 CFG_LAST_API_SUCCESS = "riot_api_last_success"
 CFG_RIOT_INSTALL_PATH = "riot_install_path"
 CFG_CONFIRM_SWITCH = "confirm_switch_on_click"
+CFG_AUTO_FILL_MODE = "auto_fill_mode"
 
 # Default for the confirm-on-switch setting when the vault has nothing saved.
 # ON by default so a misclick never tears down a running Riot session.
@@ -584,6 +586,10 @@ class MainWindow(QMainWindow):
             username=existing.username,
             password=existing.password,
             install_path=install_path,
+            auto_fill_mode=self.vault.get_config(
+                CFG_AUTO_FILL_MODE,
+                AUTO_FILL_CLIPBOARD,
+            ),
         )
         self._switch_worker.moveToThread(self._switch_thread)
         self._switch_thread.started.connect(self._switch_worker.run)

@@ -7,8 +7,8 @@
 #      resume the previous session.
 #   3. subprocess.Popen the Riot Client with the LoL launch flags.
 #   4. Wait for the login window to appear (poll pywinauto, up to N seconds).
-#   5. Bring it to the foreground and type:
-#        Ctrl+A, Delete, <username>, Tab, Ctrl+A, Delete, <password>, Enter.
+#   5. Bring it to the foreground and fill credentials. Clipboard paste is
+#      the default fast path; slow typing remains as a fallback.
 #
 # Why each piece exists:
 #   - Killing is reliable; sending a logout API call is not. We don't have
@@ -36,10 +36,14 @@ import psutil
 # this module without exploding.
 try:
     import pywinauto
+    from pywinauto import clipboard as pwa_clipboard
+    from pywinauto import Desktop as pwa_desktop
     from pywinauto import keyboard as pwa_keyboard
     PYWINAUTO_AVAILABLE = True
 except ImportError:  # pragma: no cover
     pywinauto = None
+    pwa_clipboard = None
+    pwa_desktop = None
     pwa_keyboard = None
     PYWINAUTO_AVAILABLE = False
 
@@ -78,9 +82,21 @@ RIOT_WINDOW_TITLE_REGEX = "Riot Client.*"
 # Time budgets.
 KILL_WAIT_SECONDS = 5.0      # how long to wait for processes to actually exit
 WINDOW_WAIT_SECONDS = 60.0   # how long we'll wait for the login window
-WINDOW_POLL_INTERVAL = 1.0
+WINDOW_POLL_INTERVAL = 0.25
 FOCUS_SETTLE_SECONDS = 0.6   # let the field be ready after set_focus
 KEY_PAUSE_SECONDS = 0.03     # delay between keystrokes (avoids dropped chars)
+CLIPBOARD_RETRY_COUNT = 8
+CLIPBOARD_RETRY_SECONDS = 0.04
+PASTE_FOCUS_SETTLE_SECONDS = 0.05
+CLIPBOARD_SETTLE_SECONDS = 0.02
+PASTE_SETTLE_SECONDS = 0.04
+PASTE_TAB_SETTLE_SECONDS = 0.18
+FOCUS_RETRY_SECONDS = 6.0
+FOCUS_RETRY_INTERVAL = 0.2
+
+AUTO_FILL_CLIPBOARD = "clipboard"
+AUTO_FILL_TYPING = "typing"
+AUTO_FILL_MODES = {AUTO_FILL_CLIPBOARD, AUTO_FILL_TYPING}
 
 log = logging.getLogger(__name__)
 
@@ -343,6 +359,119 @@ def wait_for_login_window(timeout: float = WINDOW_WAIT_SECONDS):
     )
 
 
+def wait_for_login_window_fast(timeout: float = WINDOW_WAIT_SECONDS):
+    # Faster probe than Application.connect(timeout=1): scan the desktop
+    # window tree without spending a full second on each failed poll. Try the
+    # lighter Win32 backend first because we only need the top-level native
+    # window for focusing and send_keys; UIA is the fallback.
+    if not PYWINAUTO_AVAILABLE:
+        raise PywinautoUnavailable(
+            "pywinauto is not installed. Run `pip install pywinauto`."
+        )
+
+    log.info("fast-waiting up to %.1fs for Riot Client window", timeout)
+    deadline = time.monotonic() + timeout
+    last_err: Optional[Exception] = None
+    while time.monotonic() < deadline:
+        for backend in ("win32", "uia"):
+            try:
+                window = pwa_desktop(backend=backend).window(
+                    title_re=RIOT_WINDOW_TITLE_REGEX
+                )
+                if window.exists(timeout=0) and window.is_visible():
+                    log.info("Riot Client window detected via %s", backend)
+                    return window
+            except Exception as exc:
+                last_err = exc
+        time.sleep(WINDOW_POLL_INTERVAL)
+
+    raise RiotWindowNotFound(
+        f"Riot Client window did not appear within {timeout:.0f}s "
+        f"(last error: {last_err})"
+    )
+
+
+def _iter_riot_windows():
+    # Yield fresh wrappers each time. Riot Client can briefly expose a native
+    # window whose handle goes stale while CEF finishes booting; re-querying
+    # avoids pasting into nowhere after an invalid-handle focus failure.
+    for backend in ("win32", "uia"):
+        try:
+            window = pwa_desktop(backend=backend).window(
+                title_re=RIOT_WINDOW_TITLE_REGEX
+            )
+            if window.exists(timeout=0) and window.is_visible():
+                yield backend, window
+        except Exception as exc:
+            log.debug("window probe via %s failed: %s", backend, exc)
+
+
+def focus_riot_window(initial_window=None,
+                      timeout: float = FOCUS_RETRY_SECONDS):
+    # Focus must actually succeed before we send Ctrl+V or keystrokes.
+    # Returning a focused, freshly-valid wrapper is better than continuing
+    # after set_focus() fails and pretending the login worked.
+    deadline = time.monotonic() + timeout
+    last_err: Optional[Exception] = None
+
+    candidates = []
+    if initial_window is not None:
+        candidates.append(("initial", initial_window))
+
+    while time.monotonic() < deadline:
+        for backend, window in candidates + list(_iter_riot_windows()):
+            try:
+                window.set_focus()
+                log.info("Riot Client window focused via %s", backend)
+                return window
+            except RuntimeError as exc:
+                # Some pywinauto wrappers raise when a title query matches
+                # both the bootstrap Riot window and the real login window.
+                # Pick the last visible candidate and focus that explicitly.
+                if "There are 2 elements" in str(exc):
+                    focused = _focus_last_matching_window(backend)
+                    if focused is not None:
+                        return focused
+                    last_err = exc
+                    log.debug("ambiguous focus via %s had no usable candidate: %s",
+                              backend, exc)
+                    continue
+                last_err = exc
+                log.debug("set_focus failed via %s: %s", backend, exc)
+            except Exception as exc:
+                last_err = exc
+                log.debug("set_focus failed via %s: %s", backend, exc)
+
+        candidates = []
+        time.sleep(FOCUS_RETRY_INTERVAL)
+
+    raise RiotWindowNotFound(
+        f"Riot Client window could not be focused "
+        f"(last error: {last_err})"
+    )
+
+
+def _focus_last_matching_window(backend: str):
+    try:
+        windows = pwa_desktop(backend=backend).windows(
+            title_re=RIOT_WINDOW_TITLE_REGEX,
+            visible_only=True,
+            enabled_only=False,
+        )
+    except Exception as exc:
+        log.debug("listing Riot windows via %s failed: %s", backend, exc)
+        return None
+
+    for window in reversed(windows):
+        try:
+            window.set_focus()
+            log.info("Riot Client window focused via %s candidate", backend)
+            return window
+        except Exception as exc:
+            log.debug("candidate focus via %s failed: %s", backend, exc)
+    return None
+
+
 # ---------- keystroke helpers ----------
 
 # Characters that pywinauto.send_keys treats as syntax. We wrap each in
@@ -369,10 +498,7 @@ def type_credentials(window, username: str, password: str) -> None:
         raise PywinautoUnavailable("pywinauto not available")
 
     log.info("focusing Riot Client window")
-    try:
-        window.set_focus()
-    except Exception as exc:
-        log.warning("set_focus failed: %s — continuing anyway", exc)
+    window = focus_riot_window(window)
 
     # Wait for the page to fully render and form to be interactive
     time.sleep(1.5)
@@ -405,6 +531,97 @@ def type_credentials(window, username: str, password: str) -> None:
     log.info("credentials sent")
 
 
+def _clipboard_text() -> str:
+    if not PYWINAUTO_AVAILABLE:
+        raise PywinautoUnavailable("pywinauto not available")
+    try:
+        return pwa_clipboard.GetData()
+    except Exception as exc:
+        log.warning("could not read clipboard before paste fill: %s", exc)
+        return ""
+
+
+def _set_clipboard_text(text: str) -> None:
+    if not PYWINAUTO_AVAILABLE:
+        raise PywinautoUnavailable("pywinauto not available")
+    last_exc: Optional[Exception] = None
+    for _attempt in range(CLIPBOARD_RETRY_COUNT):
+        try:
+            pwa_clipboard.win32clipboard.OpenClipboard()
+            try:
+                pwa_clipboard.win32clipboard.EmptyClipboard()
+                pwa_clipboard.win32clipboard.SetClipboardData(
+                    pwa_clipboard.win32clipboard.CF_UNICODETEXT,
+                    text,
+                )
+                return
+            finally:
+                pwa_clipboard.win32clipboard.CloseClipboard()
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(CLIPBOARD_RETRY_SECONDS)
+    raise LauncherError(f"could not set clipboard text: {last_exc}")
+
+
+def _paste_text(text: str) -> None:
+    _set_clipboard_text(text)
+    time.sleep(CLIPBOARD_SETTLE_SECONDS)
+    pwa_keyboard.send_keys("^v", pause=0.05, vk_packet=False)
+    time.sleep(PASTE_SETTLE_SECONDS)
+
+
+def paste_credentials(window, username: str, password: str) -> None:
+    # Faster and less visibly leaky than type_credentials(). We still need
+    # Riot Client focused because the login form lives inside a CEF webview,
+    # but this reduces the focus-sensitive window to a couple of paste events.
+    if not PYWINAUTO_AVAILABLE:
+        raise PywinautoUnavailable("pywinauto not available")
+
+    log.info("focusing Riot Client window for clipboard fill")
+    window = focus_riot_window(window)
+
+    time.sleep(PASTE_FOCUS_SETTLE_SECONDS)
+    original_clipboard = _clipboard_text()
+    try:
+        log.info("pasting username (length=%d)", len(username))
+        pwa_keyboard.send_keys("^a{DELETE}", pause=0.05)
+        _paste_text(username)
+
+        log.info("tabbing to password field")
+        pwa_keyboard.send_keys("{TAB}", pause=0.05)
+        time.sleep(PASTE_TAB_SETTLE_SECONDS)
+
+        log.info("pasting password (length=%d)", len(password))
+        pwa_keyboard.send_keys("^a{DELETE}", pause=0.05)
+        _paste_text(password)
+
+        pwa_keyboard.send_keys("{ENTER}", pause=0.05)
+        log.info("credentials pasted")
+    finally:
+        try:
+            _set_clipboard_text(original_clipboard)
+            log.debug("clipboard restored after paste fill")
+        except Exception as exc:
+            log.warning("could not restore clipboard after paste fill: %s", exc)
+
+
+def fill_credentials(window, username: str, password: str,
+                     auto_fill_mode: str = AUTO_FILL_CLIPBOARD,
+                     progress: ProgressCb = _noop_progress) -> None:
+    mode = auto_fill_mode if auto_fill_mode in AUTO_FILL_MODES else AUTO_FILL_CLIPBOARD
+    log.info("auto-fill mode selected: %s", mode)
+    if mode == AUTO_FILL_TYPING:
+        type_credentials(window, username, password)
+        return
+
+    try:
+        paste_credentials(window, username, password)
+    except Exception as exc:
+        log.warning("clipboard fill failed; falling back to typing: %s", exc)
+        progress("Paste failed; typing credentials...")
+        type_credentials(window, username, password)
+
+
 # ---------- top-level orchestrator ----------
 
 def switch_account(
@@ -413,6 +630,7 @@ def switch_account(
     install_path: str = DEFAULT_RIOT_INSTALL_PATH,
     progress: ProgressCb = _noop_progress,
     window_timeout: float = WINDOW_WAIT_SECONDS,
+    auto_fill_mode: str = AUTO_FILL_CLIPBOARD,
 ) -> None:
     # Single entry point used by SwitchWorker (Phase 4). Each step pushes a
     # progress message so the UI can show what's happening.
@@ -436,10 +654,19 @@ def switch_account(
     launch_riot_client(install_path)
 
     progress("Waiting for login window...")
-    window = wait_for_login_window(timeout=window_timeout)
+    window = wait_for_login_window_fast(timeout=window_timeout)
 
-    progress("Filling credentials...")
-    type_credentials(window, username, password)
+    if auto_fill_mode == AUTO_FILL_TYPING:
+        progress("Typing credentials...")
+    else:
+        progress("Pasting credentials...")
+    fill_credentials(
+        window,
+        username,
+        password,
+        auto_fill_mode=auto_fill_mode,
+        progress=progress,
+    )
 
     progress("Logged in.")
     log.info("switch_account: complete")

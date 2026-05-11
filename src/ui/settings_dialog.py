@@ -8,6 +8,7 @@
 #   - riot_install_path       : path to RiotClientServices.exe
 #   - default_region          : platform code prefilled in Add Account dialog
 #   - confirm_switch_on_click : show "are you sure?" before launching Riot
+#   - auto_fill_mode          : clipboard paste or slow typing
 
 import logging
 import time
@@ -35,6 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.riot.api import RiotApiClient
+from src.riot.launcher import AUTO_FILL_CLIPBOARD, AUTO_FILL_TYPING
 from src.storage.vault import Vault
 from src.ui.add_account_dialog import REGIONS
 
@@ -47,6 +49,7 @@ CFG_LAST_API_SUCCESS = "riot_api_last_success"
 CFG_RIOT_INSTALL_PATH = "riot_install_path"
 CFG_DEFAULT_REGION = "default_region"
 CFG_CONFIRM_SWITCH = "confirm_switch_on_click"
+CFG_AUTO_FILL_MODE = "auto_fill_mode"
 
 # Default region fallback when the vault has nothing saved yet. Matches the
 # fallback used by Account.region and MainWindow's get_config call.
@@ -163,6 +166,14 @@ class SettingsDialog(QDialog):
         )
         form.addRow("", self.confirm_switch_box)
 
+        # Auto-fill method. Clipboard paste is faster and less visually noisy;
+        # slow typing remains available if Riot Client ever rejects paste.
+        self.auto_fill_combo = QComboBox()
+        self.auto_fill_combo.addItem("Clipboard paste (recommended)",
+                                     AUTO_FILL_CLIPBOARD)
+        self.auto_fill_combo.addItem("Slow typing fallback", AUTO_FILL_TYPING)
+        form.addRow("Auto-fill method:", self.auto_fill_combo)
+
         outer.addLayout(form)
 
         # Help links.
@@ -219,6 +230,10 @@ class SettingsDialog(QDialog):
         # Confirm-before-switch. Falls back to ON if the key was never written.
         confirm = bool(self.vault.get_config(CFG_CONFIRM_SWITCH, DEFAULT_CONFIRM_SWITCH))
         self.confirm_switch_box.setChecked(confirm)
+
+        mode = self.vault.get_config(CFG_AUTO_FILL_MODE, AUTO_FILL_CLIPBOARD)
+        idx = self.auto_fill_combo.findData(mode)
+        self.auto_fill_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _region_index_for_code(self, code: str) -> int:
         # Linear search — REGIONS only has ~16 entries.
@@ -364,6 +379,16 @@ class SettingsDialog(QDialog):
             log.info("settings: confirm-switch saved (%s)", confirm)
         except Exception as exc:
             log.exception("vault save failed (confirm-switch)")
+            QMessageBox.critical(self, "Save failed", str(exc))
+            return
+
+        # ---- auto-fill mode ----
+        auto_fill_mode = self.auto_fill_combo.currentData() or AUTO_FILL_CLIPBOARD
+        try:
+            self.vault.set_config(CFG_AUTO_FILL_MODE, auto_fill_mode)
+            log.info("settings: auto-fill mode saved (%s)", auto_fill_mode)
+        except Exception as exc:
+            log.exception("vault save failed (auto-fill mode)")
             QMessageBox.critical(self, "Save failed", str(exc))
             return
 
