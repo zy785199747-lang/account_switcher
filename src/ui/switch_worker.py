@@ -33,17 +33,19 @@ class SwitchWorker(QObject):
     # Emitted with a short status string (e.g. "Launching Riot Client...").
     progress = pyqtSignal(str)
     # Emitted on success after the credentials have been typed.
-    finished = pyqtSignal()
+    finished = pyqtSignal(str)
     # Emitted on any failure with a human-friendly message.
     failed = pyqtSignal(str)
 
     def __init__(self, username: str, password: str, install_path: str,
-                 auto_fill_mode: str = AUTO_FILL_CLIPBOARD):
+                 auto_fill_mode: str = AUTO_FILL_CLIPBOARD,
+                 riot_id: str = ""):
         super().__init__()
         self._username = username
         self._password = password
         self._install_path = install_path
         self._auto_fill_mode = auto_fill_mode
+        self._riot_id = riot_id
 
     def run(self) -> None:
         # Runs on the worker thread. Never throw — convert all exceptions to
@@ -56,7 +58,7 @@ class SwitchWorker(QObject):
                 auto_fill_mode=self._auto_fill_mode,
                 progress=self._emit_progress,
             )
-            self.finished.emit()
+            self.finished.emit(self._riot_id)
         except LauncherError as exc:
             log.info("switch failed: %s", exc)
             self.failed.emit(str(exc))

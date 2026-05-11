@@ -119,10 +119,12 @@ def test_switch_worker_constructs():
         username="TestUser",
         password="TestPassword123",
         install_path="C:\\Riot Games\\Riot Client\\RiotClientServices.exe",
+        riot_id="Player#NA1",
     )
     assert worker._username == "TestUser"
     assert worker._password == "TestPassword123"
     assert worker._install_path == "C:\\Riot Games\\Riot Client\\RiotClientServices.exe"
+    assert worker._riot_id == "Player#NA1"
 
 
 def test_switch_worker_signals():

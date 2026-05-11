@@ -70,6 +70,7 @@ from src.updater import (
     install_downloaded_update,
     running_from_frozen_exe,
 )
+from src.version import APP_VERSION
 
 # Vault config keys (kept consistent with admin_window.py and settings_dialog.py).
 CFG_API_KEY = "riot_api_key"
@@ -126,6 +127,10 @@ class MainWindow(QMainWindow):
         self._update_thread: Optional[QThread] = None
         self._update_worker: Optional[UpdateWorker] = None
         self._update_manual = False
+        self._version_status_label: Optional[QLabel] = None
+        self._status_restore_timer = QTimer(self)
+        self._status_restore_timer.setSingleShot(True)
+        self._status_restore_timer.timeout.connect(self._restore_default_status)
 
         # Manual card-drag visuals. The layout order only changes on release;
         # during drag, a pixmap ghost follows the cursor and the source card
@@ -233,7 +238,24 @@ class MainWindow(QMainWindow):
 
     def _build_status_bar(self) -> None:
         sb = self.statusBar()
-        sb.showMessage(f"Vault: {self.vault.path}")
+        sb.showMessage(self._default_status_message())
+
+        self._version_status_label = QLabel(f"Version {APP_VERSION}")
+        self._version_status_label.setStyleSheet("color: #666;")
+
+        sb.addPermanentWidget(self._version_status_label, 0)
+
+    def _default_status_message(self) -> str:
+        return f"Vault: {self.vault.path}"
+
+    def _restore_default_status(self) -> None:
+        self.statusBar().showMessage(self._default_status_message())
+
+    def _show_status(self, message: str, timeout_ms: int = 0) -> None:
+        self._status_restore_timer.stop()
+        self.statusBar().showMessage(message)
+        if timeout_ms > 0:
+            self._status_restore_timer.start(timeout_ms)
 
     # ---------- grid management ----------
 
@@ -420,7 +442,7 @@ class MainWindow(QMainWindow):
             return False
 
         self._refresh_grid()
-        self.statusBar().showMessage("Account order updated.", 3000)
+        self._show_status("Account order updated.", 3000)
         return True
 
     # ---------- actions: add / edit / delete ----------
@@ -601,6 +623,7 @@ class MainWindow(QMainWindow):
             username=existing.username,
             password=existing.password,
             install_path=install_path,
+            riot_id=riot_id,
             auto_fill_mode=self.vault.get_config(
                 CFG_AUTO_FILL_MODE,
                 AUTO_FILL_CLIPBOARD,
@@ -622,19 +645,24 @@ class MainWindow(QMainWindow):
         log.debug("switch dialog message: %s", msg)
         if self._switch_dialog is not None:
             self._switch_dialog.setLabelText(msg)
+        self._show_status(msg)
 
-    def _on_switch_finished(self) -> None:
-        log.info("switch finished successfully")
+    def _on_switch_finished(self, riot_id: str) -> None:
+        log.info("switch finished successfully for %s", riot_id)
         if self._switch_dialog is not None:
             self._switch_dialog.close()
             self._switch_dialog = None
-        self.statusBar().showMessage("Logged in.", 5000)
+        if riot_id:
+            self._show_status(f"Logged in as {riot_id}.", 5000)
+        else:
+            self._show_status("Logged in.", 5000)
 
     def _on_switch_failed(self, msg: str) -> None:
         log.info("switch failed: %s", msg)
         if self._switch_dialog is not None:
             self._switch_dialog.close()
             self._switch_dialog = None
+        self._show_status("Switch failed.", 5000)
         QMessageBox.critical(self, "Switch failed", msg)
 
     def _on_switch_thread_finished(self) -> None:
@@ -726,6 +754,7 @@ class MainWindow(QMainWindow):
 
         log.info("refresh-on-launch: %d/%d accounts need a fetch",
                  len(stale), len(self.vault.accounts))
+        self._show_status("Refreshing ranks...")
         had_success = False
         had_unavailable = False
         for account in stale:
@@ -751,9 +780,14 @@ class MainWindow(QMainWindow):
 
         if had_success:
             self._refresh_grid()
-            self.statusBar().showMessage(
-                f"Ranks refreshed at {time.strftime('%H:%M:%S')}", 5000
+            self._show_status(
+                f"Ranks refreshed at {time.strftime('%H:%M:%S')}",
+                5000,
             )
+        elif had_unavailable:
+            self._show_status("Rank refresh unavailable.", 5000)
+        else:
+            self._restore_default_status()
 
         # Now that icon IDs are populated (refresh_rank wrote them), download
         # any profile icon PNGs that aren't on disk yet. Tiny files, but go
@@ -792,6 +826,7 @@ class MainWindow(QMainWindow):
         log.info("refresh ranks clicked (%d accounts)", len(self.vault.accounts))
         if not self.vault.accounts:
             return
+        self._show_status("Refreshing ranks...")
 
         # Pull the API key fresh in case admin changed it since startup.
         self._reload_api_client()
@@ -823,12 +858,17 @@ class MainWindow(QMainWindow):
 
         self._refresh_grid()
         if had_success:
-            self.statusBar().showMessage(
-                f"Ranks refreshed at {time.strftime('%H:%M:%S')}", 5000
+            self._show_status(
+                f"Ranks refreshed at {time.strftime('%H:%M:%S')}",
+                5000,
             )
             # Catch any icon IDs that changed since last launch (user picked a
             # new profile icon in-game). No-op when nothing new is missing.
             self._download_missing_profile_icons()
+        elif had_unavailable:
+            self._show_status("Rank refresh unavailable.", 5000)
+        else:
+            self._show_status("Ranks are up to date.", 5000)
 
     def _on_refresh_one(self, account_id: str) -> None:
         log.info("refresh-one for account_id=%s", account_id)
@@ -836,8 +876,10 @@ class MainWindow(QMainWindow):
         if existing is None:
             return
         self._reload_api_client()
+        self._show_status("Refreshing rank...")
         self._try_refresh_one(existing, force=True)
         self._refresh_grid()
+        self._show_status("Rank refresh finished.", 5000)
 
     def _on_settings_clicked(self) -> None:
         log.info("settings clicked")
@@ -873,7 +915,7 @@ class MainWindow(QMainWindow):
         log.info("update check started (manual=%s)", manual)
         self._update_manual = manual
         if manual:
-            self.statusBar().showMessage("Checking for updates...", 5000)
+            self._show_status("Checking for updates...")
 
         self._update_thread = QThread(self)
         self._update_worker = UpdateWorker(download=False)
@@ -888,6 +930,10 @@ class MainWindow(QMainWindow):
 
     def _on_update_available(self, info) -> None:
         log.info("update available: %s", info.latest_version)
+        self._show_status(
+            f"Update available: {info.latest_version}",
+            5000,
+        )
         body = format_update_summary(info)
         if running_from_frozen_exe():
             body += "\n\nDownload and install it now? The app will restart."
@@ -916,15 +962,18 @@ class MainWindow(QMainWindow):
 
     def _on_no_update_available(self) -> None:
         log.info("no update available")
+        self._show_status("No update available.", 5000)
         if self._update_manual:
             QMessageBox.information(
                 self,
                 "No update available",
-                "You are already on the latest version.",
+                f"You are already on the latest version.\n\n"
+                f"Current version: {APP_VERSION}",
             )
 
     def _on_update_failed(self, msg: str) -> None:
         log.info("update check failed: %s", msg)
+        self._show_status("Update check failed.", 5000)
         if self._update_manual:
             QMessageBox.warning(
                 self,
@@ -939,7 +988,7 @@ class MainWindow(QMainWindow):
             self._on_update_thread_finished()
 
         log.info("update download started: %s", info.latest_version)
-        self.statusBar().showMessage("Downloading update...", 5000)
+        self._show_status("Downloading update...")
         self._update_manual = True
         self._update_thread = QThread(self)
         self._update_worker = UpdateWorker(download=True, info=info)
@@ -953,6 +1002,7 @@ class MainWindow(QMainWindow):
 
     def _on_update_downloaded(self, info, path) -> None:
         log.info("update downloaded: %s", path)
+        self._show_status("Update downloaded.", 5000)
         try:
             install_downloaded_update(path)
         except Exception as exc:
