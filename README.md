@@ -2,7 +2,7 @@
 
 A simple Windows app for managing multiple Riot accounts, checking basic League account info, and switching accounts without copy-pasting credentials by hand.
 
-![Version](https://img.shields.io/badge/version-1.1.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Version](https://img.shields.io/badge/version-1.1.1-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
 ## What You Can Do
 
