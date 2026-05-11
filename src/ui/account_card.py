@@ -19,9 +19,10 @@
 import logging
 import time
 
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -82,10 +83,18 @@ class AccountCard(QFrame):
     refresh_requested = pyqtSignal(str)
     # Emitted on menu: (account_id, direction) where direction is "up" or "down"
     move_requested = pyqtSignal(str, str)
+    # Emitted when a reorder drag crosses the movement threshold:
+    # (account_id, global_mouse_pos, cursor_offset_inside_card).
+    drag_reorder_started = pyqtSignal(str, QPoint, QPoint)
+    drag_reorder_moved = pyqtSignal(str, QPoint)
+    # Emitted after a left-button drag finishes: (account_id, global_drop_pos).
+    drag_reorder_requested = pyqtSignal(str, QPoint)
 
     def __init__(self, account: Account, parent=None):
         super().__init__(parent)
         self.account = account
+        self._press_pos = QPoint()
+        self._dragging_for_reorder = False
 
         self.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -418,12 +427,59 @@ class AccountCard(QFrame):
             self._show_context_menu(event.globalPosition().toPoint())
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+            self._dragging_for_reorder = False
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # type: ignore[override]
+        if not event.buttons() & Qt.MouseButton.LeftButton:
+            super().mouseMoveEvent(event)
+            return
+
+        distance = (event.position().toPoint() - self._press_pos).manhattanLength()
+        if distance < QApplication.startDragDistance():
+            super().mouseMoveEvent(event)
+            return
+
+        if not self._dragging_for_reorder:
+            log.debug("card drag started for %s", self.account.id)
+            self._dragging_for_reorder = True
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.drag_reorder_started.emit(
+                self.account.id,
+                event.globalPosition().toPoint(),
+                self._press_pos,
+            )
+        else:
+            self.drag_reorder_moved.emit(
+                self.account.id,
+                event.globalPosition().toPoint(),
+            )
+        event.accept()
+
+    def mouseReleaseEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging_for_reorder:
+            log.debug("card drag released for %s", self.account.id)
+            self._dragging_for_reorder = False
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.drag_reorder_requested.emit(
+                self.account.id,
+                event.globalPosition().toPoint(),
+            )
+            event.accept()
+            return
+        self._dragging_for_reorder = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):  # type: ignore[override]
         # The intentional gesture for "switch to this account." Pairs with
         # the Confirm-before-switch setting as a second safety layer.
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._dragging_for_reorder:
+                event.accept()
+                return
             log.debug("card double-clicked: switch requested for %s",
                       self.account.id)
             self.switch_requested.emit(self.account.id)

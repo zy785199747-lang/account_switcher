@@ -3,8 +3,9 @@
 import logging
 from typing import List
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QListWidget,
@@ -18,6 +19,63 @@ from PyQt6.QtWidgets import (
 from src.models import Account
 
 log = logging.getLogger(__name__)
+
+
+class ReorderListWidget(QListWidget):
+    # QListWidget's built-in InternalMove can be platform/style sensitive in
+    # this app, so we keep row movement explicit: press an item, drag over
+    # another row, and we move the item there immediately.
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._press_pos = QPoint()
+        self._dragging_row = -1
+        self._dragging = False
+
+        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.setDragDropMode(QListWidget.DragDropMode.NoDragDrop)
+        self.setDropIndicatorShown(True)
+
+    def mousePressEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+            self._dragging_row = self.row(self.itemAt(self._press_pos))
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # type: ignore[override]
+        if not event.buttons() & Qt.MouseButton.LeftButton or self._dragging_row < 0:
+            super().mouseMoveEvent(event)
+            return
+
+        pos = event.position().toPoint()
+        distance = (pos - self._press_pos).manhattanLength()
+        if not self._dragging and distance < QApplication.startDragDistance():
+            super().mouseMoveEvent(event)
+            return
+
+        self._dragging = True
+        self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+
+        target_row = self.row(self.itemAt(pos))
+        if target_row < 0:
+            target_row = self.count() - 1 if pos.y() >= self.viewport().height() else 0
+
+        if target_row != self._dragging_row:
+            item = self.takeItem(self._dragging_row)
+            self.insertItem(target_row, item)
+            self.setCurrentRow(target_row)
+            log.debug("drag-moved item from row %d to %d",
+                      self._dragging_row, target_row)
+            self._dragging_row = target_row
+
+        event.accept()
+
+    def mouseReleaseEvent(self, event):  # type: ignore[override]
+        self._dragging_row = -1
+        self._dragging = False
+        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        super().mouseReleaseEvent(event)
 
 
 class ReorderDialog(QDialog):
@@ -47,9 +105,10 @@ class ReorderDialog(QDialog):
         info.setStyleSheet("color: #888;")
         layout.addWidget(info)
 
-        # List widget for accounts
-        self.account_list = QListWidget()
-        self.account_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        # List widget for accounts. Dragging rows is implemented manually in
+        # ReorderListWidget so the fallback reorder dialog behaves the same
+        # way regardless of Qt's native drag/drop quirks.
+        self.account_list = ReorderListWidget()
         self.account_list.setDefaultDropAction(Qt.DropAction.MoveAction)
         layout.addWidget(self.account_list)
 

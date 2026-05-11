@@ -18,12 +18,13 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, QTimer
+from PyQt6.QtCore import QEvent, QPoint, Qt, QThread, QTimer
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -56,7 +57,7 @@ from src.riot.launcher import (
     find_riot_install_path,
 )
 from src.storage.vault import Vault
-from src.ui.account_card import AccountCard
+from src.ui.account_card import CARD_WIDTH, AccountCard
 from src.ui.add_account_dialog import AddAccountDialog, VerifyResult
 from src.ui.reorder_dialog import ReorderDialog
 from src.ui.settings_dialog import SettingsDialog
@@ -72,7 +73,7 @@ CFG_CONFIRM_SWITCH = "confirm_switch_on_click"
 # ON by default so a misclick never tears down a running Riot session.
 DEFAULT_CONFIRM_SWITCH = True
 
-CARDS_PER_ROW = 3
+CARD_GRID_MIN_COLUMNS = 1
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +114,13 @@ class MainWindow(QMainWindow):
         self._switch_thread: Optional[QThread] = None
         self._switch_worker: Optional[SwitchWorker] = None
         self._switch_dialog: Optional[QProgressDialog] = None
+
+        # Manual card-drag visuals. The layout order only changes on release;
+        # during drag, a pixmap ghost follows the cursor and the source card
+        # fades in place so the user has spatial feedback.
+        self._drag_ghost: Optional[QLabel] = None
+        self._drag_source_card: Optional[AccountCard] = None
+        self._drag_hot_spot = None
 
         self.setWindowTitle("Riot Account Switcher")
         self.resize(820, 600)
@@ -181,13 +189,15 @@ class MainWindow(QMainWindow):
         self.scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self.scroll.viewport().installEventFilter(self)
+        self._card_columns = CARD_GRID_MIN_COLUMNS
 
         self.grid_host = QWidget()
         self.grid = QGridLayout(self.grid_host)
         self.grid.setContentsMargins(8, 8, 8, 8)
         self.grid.setHorizontalSpacing(12)
         self.grid.setVerticalSpacing(12)
-        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
 
         self.scroll.setWidget(self.grid_host)
         outer.addWidget(self.scroll, 1)
@@ -210,11 +220,39 @@ class MainWindow(QMainWindow):
 
     # ---------- grid management ----------
 
+    def _card_columns_for_width(self, width: int) -> int:
+        margins = self.grid.contentsMargins()
+        usable = max(0, width - margins.left() - margins.right())
+        spacing = self.grid.horizontalSpacing()
+
+        # n cards need n * CARD_WIDTH plus (n - 1) gaps. Add one gap before
+        # integer division so exact-fit widths do not lose a column.
+        return max(
+            CARD_GRID_MIN_COLUMNS,
+            (usable + spacing) // (CARD_WIDTH + spacing),
+        )
+
+    def _relayout_cards(self) -> None:
+        # Reposition the existing card widgets for the current window width.
+        # Qt will move an existing widget when addWidget() is called again,
+        # but taking the old layout items first avoids stale cell metadata.
+        while self.grid.count():
+            self.grid.takeAt(0)
+
+        columns = self._card_columns_for_width(self.scroll.viewport().width())
+        self._card_columns = columns
+        for i, card in enumerate(self._cards):
+            row = i // columns
+            col = i % columns
+            self.grid.addWidget(card, row, col)
+
     def _refresh_grid(self) -> None:
         # Tear down existing cards and rebuild. Cheap because there will only
         # ever be a handful of accounts in practice.
         log.debug("rebuilding card grid (%d accounts)", len(self.vault.accounts))
 
+        while self.grid.count():
+            self.grid.takeAt(0)
         for card in self._cards:
             card.setParent(None)
             card.deleteLater()
@@ -235,10 +273,138 @@ class MainWindow(QMainWindow):
             card.delete_requested.connect(self._on_delete)
             card.refresh_requested.connect(self._on_refresh_one)
             card.move_requested.connect(self._on_move)
-            row = i // CARDS_PER_ROW
-            col = i % CARDS_PER_ROW
-            self.grid.addWidget(card, row, col)
+            card.drag_reorder_started.connect(self._on_card_drag_started)
+            card.drag_reorder_moved.connect(self._on_card_drag_moved)
+            card.drag_reorder_requested.connect(self._on_card_drag_reorder)
             self._cards.append(card)
+        self._relayout_cards()
+
+    def eventFilter(self, watched, event):  # type: ignore[override]
+        if watched is self.scroll.viewport() and event.type() == QEvent.Type.Resize:
+            columns = self._card_columns_for_width(event.size().width())
+            if columns != self._card_columns:
+                self._relayout_cards()
+        return super().eventFilter(watched, event)
+
+    def _drop_index_for_position(self, pos, dragged_id: str) -> int:
+        # Convert a drop point into a row-major insertion slot. The dragged
+        # card is ignored so dropping near its old position can still produce
+        # a clean "before/after the neighbours" answer.
+        cards = [c for c in self._cards if c.account.id != dragged_id]
+        if not cards:
+            return 0
+
+        rows: list[list[AccountCard]] = []
+        for card in cards:
+            geom = card.geometry()
+            for row in rows:
+                if abs(row[0].geometry().center().y() - geom.center().y()) < geom.height() // 2:
+                    row.append(card)
+                    break
+            else:
+                rows.append([card])
+
+        rows.sort(key=lambda row: row[0].geometry().top())
+        for row in rows:
+            row.sort(key=lambda card: card.geometry().left())
+
+        target_row = min(
+            rows,
+            key=lambda row: abs(row[0].geometry().center().y() - pos.y()),
+        )
+        before_rows = sum(len(row) for row in rows[:rows.index(target_row)])
+
+        for i, card in enumerate(target_row):
+            geom = card.geometry()
+            if pos.x() < geom.center().x():
+                return before_rows + i
+        return before_rows + len(target_row)
+
+    def _on_card_drag_reorder(self, dragged_id: str, global_pos) -> None:
+        self._clear_card_drag_visual()
+        drop_pos = self.grid_host.mapFromGlobal(global_pos)
+        target_index = self._drop_index_for_position(
+            drop_pos,
+            dragged_id,
+        )
+        self._reorder_card_to_index(dragged_id, target_index)
+
+    def _find_card_widget(self, account_id: str) -> Optional[AccountCard]:
+        for card in self._cards:
+            if card.account.id == account_id:
+                return card
+        return None
+
+    def _on_card_drag_started(self, account_id: str, global_pos, hot_spot) -> None:
+        card = self._find_card_widget(account_id)
+        if card is None:
+            return
+
+        self._clear_card_drag_visual()
+        self._drag_source_card = card
+        self._drag_hot_spot = hot_spot
+
+        effect = QGraphicsOpacityEffect(card)
+        effect.setOpacity(0.35)
+        card.setGraphicsEffect(effect)
+
+        ghost = QLabel(self)
+        ghost.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        ghost.setPixmap(card.grab())
+        ghost.setFixedSize(card.size())
+        ghost.setStyleSheet(
+            "QLabel { border: 1px solid #6cf; border-radius: 8px; }"
+        )
+        self._drag_ghost = ghost
+        self._move_card_drag_ghost(global_pos)
+        ghost.show()
+        ghost.raise_()
+
+    def _on_card_drag_moved(self, account_id: str, global_pos) -> None:
+        if self._drag_source_card is None:
+            self._on_card_drag_started(account_id, global_pos, QPoint())
+        self._move_card_drag_ghost(global_pos)
+
+    def _move_card_drag_ghost(self, global_pos) -> None:
+        if self._drag_ghost is None or self._drag_hot_spot is None:
+            return
+        local = self.mapFromGlobal(global_pos)
+        self._drag_ghost.move(local - self._drag_hot_spot)
+        self._drag_ghost.raise_()
+
+    def _clear_card_drag_visual(self) -> None:
+        if self._drag_source_card is not None:
+            self._drag_source_card.setGraphicsEffect(None)
+            self._drag_source_card = None
+        if self._drag_ghost is not None:
+            self._drag_ghost.hide()
+            self._drag_ghost.deleteLater()
+            self._drag_ghost = None
+        self._drag_hot_spot = None
+
+    def _reorder_card_to_index(self, account_id: str, target_index: int) -> bool:
+        old_order = [a.id for a in self.vault.accounts]
+        if account_id not in old_order:
+            return False
+
+        new_order = [i for i in old_order if i != account_id]
+        target_index = max(0, min(target_index, len(new_order)))
+        new_order.insert(target_index, account_id)
+
+        if new_order == old_order:
+            log.info("drag reorder: no change for account_id=%s", account_id)
+            return True
+
+        try:
+            self.vault.reorder(new_order)
+        except Exception as exc:
+            log.exception("drag reorder failed")
+            QMessageBox.critical(self, "Reorder failed", str(exc))
+            return False
+
+        self._refresh_grid()
+        self.statusBar().showMessage("Account order updated.", 3000)
+        return True
 
     # ---------- actions: add / edit / delete ----------
 
