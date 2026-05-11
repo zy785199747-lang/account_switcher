@@ -2,7 +2,7 @@
 
 A Windows desktop app that stores multiple Riot Games accounts encrypted, shows each as a card with current League of Legends rank, and switches between them with one click — no more copy-pasting credentials every time.
 
-![Phase status](https://img.shields.io/badge/version-0.4--switch-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Phase status](https://img.shields.io/badge/version-0.5--polish-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
 ## Features
 
@@ -104,8 +104,9 @@ GitHub Actions also rebuilds on every push to `master` and every tag — see [`.
 
 - **Edit / Delete an account**: hover its card → ✏️ or 🗑️ in the top-right corner. Right-click also works.
 - **Lock the vault** without exiting: toolbar → *Lock*. Re-prompts for the master password.
+- **Manage API key** (Phase 5+): toolbar → *Settings* → enter or update your Riot API key.
 - **Verbose console logging**: launch with `--debug`.
-- **Inspect/edit vault config** (until Phase 5 ships a Settings dialog):
+- **Inspect/edit vault config** (advanced, deprecated since Phase 5):
   ```powershell
   .venv\Scripts\python.exe scripts\vault_admin.py show
   .venv\Scripts\python.exe scripts\vault_admin.py set <key> <value>
@@ -134,21 +135,29 @@ account_switcher/
 ├── scripts/
 │   ├── seed_test_vault.py        # populate a throwaway vault for UI testing
 │   └── vault_admin.py            # CLI to read/write vault config
+├── assets/
+│   └── ranks/                    # Rank tier icon images (11 tiers + unranked)
 ├── src/
 │   ├── models.py                 # Account dataclass
 │   ├── logging_setup.py          # rotating-file logger + --debug
+│   ├── external_links.py         # op.gg URL builder
 │   ├── storage/
 │   │   ├── crypto.py             # PBKDF2 + Fernet
 │   │   └── vault.py              # encrypted JSON CRUD
 │   ├── riot/
 │   │   ├── api.py                # Riot Web API client + caching
-│   │   └── launcher.py           # process kill, session clear, launch, auto-fill
+│   │   ├── launcher.py           # process kill, session clear, launch, auto-fill
+│   │   └── ddragon.py            # DDragon image URLs for rank icons
 │   └── ui/
 │       ├── master_password.py    # set + unlock dialogs
 │       ├── main_window.py        # toolbar + card grid + banner
 │       ├── account_card.py       # per-account card (hover edit/delete icons)
 │       ├── add_account_dialog.py # add/edit form with Verify
+│       ├── settings_dialog.py    # API key management + settings
+│       ├── reorder_dialog.py     # reorder accounts drag-drop dialog
 │       ├── admin_window.py       # API key management (--admin only)
+│       ├── profile_icon.py       # profile icon rendering
+│       ├── rank_icon.py          # rank tier icon rendering
 │       └── switch_worker.py      # QThread worker for the switch flow
 └── tests/                         # 59 unit + smoke tests
 ```
@@ -162,8 +171,8 @@ This is a personal-use tool that grew up in phases. Each phase has a git tag and
 | `v0.1-vault` | Encrypted vault + master password |
 | `v0.2-crud` | Account cards UI |
 | `v0.3-api` | Riot API integration + admin window + banner |
-| `v0.4-switch` | **Current** — Riot Client launch + credential auto-fill |
-| (planned) | Phase 5: Settings dialog, clipboard fallback, polish |
+| `v0.4-switch` | Riot Client launch + credential auto-fill |
+| `v0.5-polish` | **Current** — Settings dialog, rank/profile icons, reorder, polish |
 | (planned) | Phase 6: Documentation |
 
 If you ever break `master`, the previous tag is your rollback point: `git checkout v0.3-api`.
