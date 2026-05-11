@@ -45,6 +45,17 @@ from src.models import Account
 HTTP_TIMEOUT_SECONDS = 10
 RANK_CACHE_TTL_SECONDS = 3600  # 1 hour
 RANKED_SOLO_QUEUE = "RANKED_SOLO_5x5"
+RANKED_FLEX_QUEUE = "RANKED_FLEX_SR"
+
+# Schema version of the cached_* block on each Account. Bumped any time we
+# start writing a new field so that on the first launch after an upgrade we
+# force a re-fetch even for accounts whose TTL hasn't expired yet — otherwise
+# the new field stays blank until the cache naturally ages out.
+# History:
+#   1 -> initial: cached_tier/division/lp/cached_at (solo only)
+#   2 -> phase 5: add cached_flex_tier/division/lp
+#   3 -> phase 5: add cached_profile_icon_id
+CURRENT_CACHE_SCHEMA = 3
 
 # Map platform code -> regional cluster used by account-v1.
 # https://developer.riotgames.com/docs/lol#routing-values
@@ -137,14 +148,37 @@ def league_v4_by_puuid_url(puuid: str, platform: str) -> str:
             f"/lol/league/v4/entries/by-puuid/{puuid}")
 
 
-# ---------- result type ----------
+# ---------- result types ----------
 
 @dataclass
 class RankInfo:
-    # Only solo-queue rank. The plan said we don't show flex.
+    # One queue's rank. Used for both solo and flex.
     tier: Optional[str]       # "DIAMOND", "GOLD", ... or None if unranked
     division: Optional[str]   # "I", "II", "III", "IV" or None for high tiers
     lp: Optional[int]         # league points or None if unranked
+
+    @classmethod
+    def unranked(cls) -> "RankInfo":
+        return cls(tier=None, division=None, lp=None)
+
+
+@dataclass
+class RankSet:
+    # Solo + flex bundled together. league-v4 by-puuid returns both queues
+    # in the same response, so fetching the pair costs the same as solo.
+    solo: RankInfo
+    flex: RankInfo
+
+
+@dataclass
+class AccountSnapshot:
+    # Full result of one refresh cycle: rank set + profile icon id, plus the
+    # PUUID we resolved along the way (handy for caching / debugging).
+    # profile_icon_id is None when summoner-v4 failed — rank data is still
+    # usable, the card just falls back to the procedural icon.
+    puuid: str
+    ranks: RankSet
+    profile_icon_id: Optional[int]
 
 
 # ---------- the client ----------
@@ -209,52 +243,136 @@ class RiotApiClient:
             raise RiotApiError("Riot account-v1 response did not include a PUUID.")
         return data["puuid"]
 
-    def get_solo_rank_by_puuid(self, puuid: str, platform: str) -> RankInfo:
+    def get_ranks_by_puuid(self, puuid: str, platform: str) -> RankSet:
+        # league-v4 returns one entry per queue the account has played ranked
+        # in. We pick out solo and flex; everything else (clash, TFT, etc.) is
+        # ignored. Missing queue -> Unranked for that side.
         entries = self._get(league_v4_by_puuid_url(puuid, platform))
         if not isinstance(entries, list):
             log.warning("league-v4 by-puuid returned non-list: %r", entries)
             raise RiotApiError("Riot league-v4 returned an unexpected shape.")
-        for e in entries:
-            if isinstance(e, dict) and e.get("queueType") == RANKED_SOLO_QUEUE:
-                return RankInfo(
-                    tier=e.get("tier"),
-                    division=e.get("rank"),
-                    lp=e.get("leaguePoints"),
-                )
-        # No solo-queue entry: account is unranked.
-        return RankInfo(tier=None, division=None, lp=None)
 
-    def fetch_rank(self, account: Account) -> RankInfo:
-        # Two-call chain: Riot ID -> PUUID -> solo rank.
+        solo = RankInfo.unranked()
+        flex = RankInfo.unranked()
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            qt = e.get("queueType")
+            info = RankInfo(
+                tier=e.get("tier"),
+                division=e.get("rank"),
+                lp=e.get("leaguePoints"),
+            )
+            if qt == RANKED_SOLO_QUEUE:
+                solo = info
+            elif qt == RANKED_FLEX_QUEUE:
+                flex = info
+        return RankSet(solo=solo, flex=flex)
+
+    def fetch_rank(self, account: Account) -> RankSet:
+        # Two-call chain: Riot ID -> PUUID -> both ranked queues. Used by
+        # the Verify button in AddAccountDialog where we only care about
+        # whether the Riot ID exists and what the rank is — no need for
+        # the profile-icon call.
         regional = regional_route_for(account.region)
         puuid = self.get_puuid(account.game_name, account.tag_line, regional)
-        return self.get_solo_rank_by_puuid(puuid, account.region)
+        return self.get_ranks_by_puuid(puuid, account.region)
+
+    def get_profile_icon_id(self, puuid: str, platform: str) -> Optional[int]:
+        # summoner-v4 by-puuid returns { "profileIconId": int, ... }. Riot is
+        # deprecating the encrypted "id" field on this response but the icon
+        # id keeps working. Returns None on a malformed payload (defensive).
+        data = self._get(summoner_v4_url(puuid, platform))
+        if isinstance(data, dict):
+            icon = data.get("profileIconId")
+            if isinstance(icon, int):
+                return icon
+        log.warning("summoner-v4 response missing profileIconId: %r", data)
+        return None
+
+    def fetch_snapshot(self, account: Account) -> AccountSnapshot:
+        # Three-call chain used by refresh_rank: account-v1 -> league-v4 ->
+        # summoner-v4. Profile icon is best-effort — if summoner-v4 fails we
+        # still return ranks (icon falls back to procedural). Any failure on
+        # account-v1 or league-v4 still raises, since rank data is the
+        # primary thing we care about.
+        regional = regional_route_for(account.region)
+        puuid = self.get_puuid(account.game_name, account.tag_line, regional)
+        ranks = self.get_ranks_by_puuid(puuid, account.region)
+        icon_id: Optional[int] = None
+        try:
+            icon_id = self.get_profile_icon_id(puuid, account.region)
+        except ApiUnavailable as exc:
+            # If the key got rate-limited or expired between the two calls,
+            # we still want ranks. Re-raise unavailability so the banner
+            # logic upstream can react properly.
+            log.info("profile icon fetch hit ApiUnavailable: %s", exc)
+            raise
+        except RiotApiError as exc:
+            # Any other API error is treated as "icon not available right
+            # now" — log and continue with icon_id=None.
+            log.warning("profile icon fetch failed (continuing): %s", exc)
+        return AccountSnapshot(puuid=puuid, ranks=ranks, profile_icon_id=icon_id)
 
 
 # ---------- module-level convenience ----------
 
 def is_cache_fresh(account: Account, ttl_seconds: int = RANK_CACHE_TTL_SECONDS) -> bool:
-    # Returns True if the cached rank is younger than the TTL.
+    # Pure TTL check — returns True if the cached rank is younger than the
+    # TTL. Does NOT consider schema version. Callers that want the full
+    # "should we hit the API?" answer should use cache_needs_refresh().
     if account.cached_at is None:
         return False
     return (time.time() - account.cached_at) < ttl_seconds
 
 
+def cache_needs_refresh(account: Account,
+                        ttl_seconds: int = RANK_CACHE_TTL_SECONDS) -> bool:
+    # Returns True when we should fetch from Riot. Three reasons:
+    #   1. Never been fetched (cached_at is None).
+    #   2. TTL expired.
+    #   3. Schema is older than CURRENT_CACHE_SCHEMA — the cache is missing
+    #      a field that newer code reads, so even a "young" cache is stale
+    #      from a feature-completeness point of view.
+    if account.cached_at is None:
+        return True
+    if (time.time() - account.cached_at) >= ttl_seconds:
+        return True
+    if account.cached_schema < CURRENT_CACHE_SCHEMA:
+        return True
+    return False
+
+
 def refresh_rank(client: RiotApiClient, account: Account, force: bool = False) -> bool:
-    # Updates account.cached_* in place. Returns True if a fresh fetch happened,
-    # False if the cache was still good (and we skipped the call).
-    # Caller is responsible for vault.update(account) afterwards.
-    if not force and is_cache_fresh(account):
+    # Updates account.cached_* (solo + flex + profile_icon_id) in place.
+    # Returns True if a fresh fetch happened, False if the cache was still
+    # good (and we skipped the call). Caller is responsible for
+    # vault.update(account) afterwards.
+    if not force and not cache_needs_refresh(account):
         log.debug("cache still fresh for %s#%s, skipping fetch",
                   account.game_name, account.tag_line)
         return False
 
-    info = client.fetch_rank(account)
-    account.cached_tier = info.tier
-    account.cached_division = info.division
-    account.cached_lp = info.lp
+    snap = client.fetch_snapshot(account)
+    ranks = snap.ranks
+    account.cached_tier = ranks.solo.tier
+    account.cached_division = ranks.solo.division
+    account.cached_lp = ranks.solo.lp
+    account.cached_flex_tier = ranks.flex.tier
+    account.cached_flex_division = ranks.flex.division
+    account.cached_flex_lp = ranks.flex.lp
+    # snap.profile_icon_id is None only when summoner-v4 failed mid-fetch.
+    # Preserve the previously-cached id in that case so we don't blank a
+    # working card just because one of the three calls flaked.
+    if snap.profile_icon_id is not None:
+        account.cached_profile_icon_id = snap.profile_icon_id
     account.cached_at = time.time()
-    log.info("rank refreshed for %s#%s: tier=%s div=%s lp=%s",
+    # Stamp the row with the current schema so next launch knows the cache
+    # is feature-complete and can skip the fetch within the TTL window.
+    account.cached_schema = CURRENT_CACHE_SCHEMA
+    log.info("rank refreshed for %s#%s: solo=%s/%s/%s flex=%s/%s/%s icon=%s schema=%d",
              account.game_name, account.tag_line,
-             info.tier, info.division, info.lp)
+             ranks.solo.tier, ranks.solo.division, ranks.solo.lp,
+             ranks.flex.tier, ranks.flex.division, ranks.flex.lp,
+             account.cached_profile_icon_id, CURRENT_CACHE_SCHEMA)
     return True

@@ -224,6 +224,29 @@ class Vault:
             raise KeyError(f"no account with id={account_id}")
         self.save()
 
+    def reorder(self, new_order_ids: List[str]) -> None:
+        # Rearrange self.accounts according to a permutation of the current
+        # account ids. Used by the drag-and-drop reorder feature in the UI.
+        # Strict on input: the new id list must be a permutation of the
+        # existing one — missing or extra ids raise. This is safer than
+        # silently dropping rows on a UI bug.
+        log.info("reordering vault (%d accounts)", len(new_order_ids))
+        by_id = {a.id: a for a in self.accounts}
+        existing_ids = set(by_id.keys())
+        requested_ids = set(new_order_ids)
+        if existing_ids != requested_ids:
+            missing = existing_ids - requested_ids
+            extra = requested_ids - existing_ids
+            raise ValueError(
+                f"reorder id set does not match current accounts "
+                f"(missing={missing}, extra={extra})"
+            )
+        # Duplicate ids in the new list would silently shorten the result.
+        if len(new_order_ids) != len(set(new_order_ids)):
+            raise ValueError("reorder list contains duplicate ids")
+        self.accounts = [by_id[i] for i in new_order_ids]
+        self.save()
+
     def get(self, account_id: str) -> Account:
         for a in self.accounts:
             if a.id == account_id:

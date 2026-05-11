@@ -16,7 +16,10 @@ a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    # Bundle the assets folder so rank_icon.py finds PNGs at runtime under
+    # sys._MEIPASS\assets\ranks\. The trailing 'assets' is the destination
+    # subdirectory inside the bundle (mirrors the source layout exactly).
+    datas=[('assets', 'assets')],
     # PyInstaller usually finds these via static analysis, but listing them
     # explicitly keeps the build reliable across PyQt / cryptography / pywinauto
     # version bumps that sometimes confuse the auto-detector.

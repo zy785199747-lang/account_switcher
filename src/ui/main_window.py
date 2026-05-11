@@ -18,9 +18,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread
+from PyQt6.QtCore import Qt, QThread, QTimer
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -38,11 +39,18 @@ from PyQt6.QtWidgets import (
 from src.models import Account
 from src.riot.api import (
     ApiUnavailable,
+    RankInfo,
     RiotApiClient,
     RiotApiError,
     RiotIdNotFound,
+    cache_needs_refresh,
     refresh_rank,
 )
+from src.riot.ddragon import (
+    ensure_profile_icon,
+    profile_icon_local_path,
+)
+from src.ui.profile_icon import clear_cache as clear_profile_icon_pixmap_cache
 from src.riot.launcher import (
     DEFAULT_RIOT_INSTALL_PATH,
     find_riot_install_path,
@@ -50,17 +58,38 @@ from src.riot.launcher import (
 from src.storage.vault import Vault
 from src.ui.account_card import AccountCard
 from src.ui.add_account_dialog import AddAccountDialog, VerifyResult
+from src.ui.reorder_dialog import ReorderDialog
 from src.ui.settings_dialog import SettingsDialog
 from src.ui.switch_worker import SwitchWorker
 
-# Vault config keys (kept consistent with admin_window.py).
+# Vault config keys (kept consistent with admin_window.py and settings_dialog.py).
 CFG_API_KEY = "riot_api_key"
 CFG_LAST_API_SUCCESS = "riot_api_last_success"
 CFG_RIOT_INSTALL_PATH = "riot_install_path"
+CFG_CONFIRM_SWITCH = "confirm_switch_on_click"
+
+# Default for the confirm-on-switch setting when the vault has nothing saved.
+# ON by default so a misclick never tears down a running Riot session.
+DEFAULT_CONFIRM_SWITCH = True
 
 CARDS_PER_ROW = 3
 
 log = logging.getLogger(__name__)
+
+
+def _format_rank_one_line(info: RankInfo) -> str:
+    # "DIAMOND" / "II" / 47   -> "Diamond II 47 LP"
+    # None / None / None      -> "Unranked"
+    # Mirrors AccountCard._format_one_rank but kept local so the verify
+    # preview doesn't depend on the card widget.
+    if info.tier is None:
+        return "Unranked"
+    bits = [info.tier.title()]
+    if info.division:
+        bits.append(info.division)
+    if info.lp is not None:
+        bits.append(f"{info.lp} LP")
+    return " ".join(bits)
 
 
 class MainWindow(QMainWindow):
@@ -93,6 +122,12 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
 
         self._refresh_grid()
+
+        # Kick off a launch-time rank refresh once the window has had a chance
+        # to paint. refresh_rank(force=False) skips anything still inside its
+        # 1h cache TTL, so subsequent launches don't hammer the API and the
+        # user gets an instant window. Only stale rows actually hit the network.
+        QTimer.singleShot(150, self._refresh_on_launch)
 
     # ---------- layout ----------
 
@@ -199,6 +234,7 @@ class MainWindow(QMainWindow):
             card.edit_requested.connect(self._on_edit)
             card.delete_requested.connect(self._on_delete)
             card.refresh_requested.connect(self._on_refresh_one)
+            card.move_requested.connect(self._on_move)
             row = i // CARDS_PER_ROW
             col = i % CARDS_PER_ROW
             self.grid.addWidget(card, row, col)
@@ -282,6 +318,36 @@ class MainWindow(QMainWindow):
             return
         self._refresh_grid()
 
+    # ---------- actions: drag-and-drop reorder ----------
+
+    def _on_move(self, account_id: str, action: str) -> None:
+        # Move action from context menu. For now only "reorder" is implemented.
+        if action != "reorder":
+            log.warning("unknown move action: %s", action)
+            return
+
+        log.info("reorder dialog requested")
+        dlg = ReorderDialog(self.vault.accounts, parent=self)
+        if dlg.exec() != ReorderDialog.DialogCode.Accepted:
+            return
+
+        new_order = dlg.get_new_order()
+        log.info("reorder: applying new order with %d accounts", len(new_order))
+
+        # No-op check
+        old_order = [a.id for a in self.vault.accounts]
+        if new_order == old_order:
+            log.info("reorder: no change, skipping save")
+            return
+
+        try:
+            self.vault.reorder(new_order)
+        except Exception as exc:
+            log.exception("vault reorder failed")
+            QMessageBox.critical(self, "Reorder failed", str(exc))
+            return
+        self._refresh_grid()
+
     # ---------- actions: stubs filled in by later phases ----------
 
     def _on_switch(self, account_id: str) -> None:
@@ -302,6 +368,31 @@ class MainWindow(QMainWindow):
             log.warning("switch: account_id=%s not found", account_id)
             return
 
+        riot_id = f"{existing.game_name}#{existing.tag_line}"
+
+        # Confirmation gate (Settings -> "Confirm before switching"). Default
+        # ON. The setting is read fresh each click so toggling it in Settings
+        # takes effect immediately without restarting the window. The note,
+        # when set, is shown in the prompt so the user can sanity-check that
+        # they're switching to the right account before Riot Client dies.
+        if bool(self.vault.get_config(CFG_CONFIRM_SWITCH, DEFAULT_CONFIRM_SWITCH)):
+            body = f"Switch to {riot_id}?"
+            note = (existing.note or "").strip()
+            if note:
+                body += f"\n\nNote: {note}"
+            body += ("\n\nThis will close any running Riot Client and log "
+                     "you in as this account.")
+            reply = QMessageBox.question(
+                self,
+                "Confirm switch",
+                body,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                log.info("switch cancelled by user for account_id=%s", account_id)
+                return
+
         # main.py guarantees a valid install path is in the vault at startup.
         # If the file disappeared mid-session (uninstall, drive ejected) the
         # picker fallback handles it.
@@ -309,7 +400,6 @@ class MainWindow(QMainWindow):
         if install_path is None:
             log.info("switch aborted: no install path available")
             return
-        riot_id = f"{existing.game_name}#{existing.tag_line}"
 
         # Progress dialog — modal, no cancel button (cancelling mid-launch is
         # messy; user can close the Riot Client manually if needed).
@@ -402,6 +492,93 @@ class MainWindow(QMainWindow):
         self.vault.set_config(CFG_RIOT_INSTALL_PATH, path)
         return path
 
+    def _refresh_on_launch(self) -> None:
+        # Best-effort refresh fired once after MainWindow opens. Behaviour rules:
+        #   - No API key configured -> skip entirely (quiet, no banner).
+        #   - For each account, refresh_rank(force=False) skips fresh caches
+        #     (<1h old) so a fast subsequent launch does zero network work.
+        #   - ApiUnavailable flips the banner and aborts the loop (no point
+        #     trying the rest with the same broken key).
+        #   - Per-account RiotApiError is logged and skipped — one bad Riot ID
+        #     shouldn't poison the launch path.
+        #   - processEvents() between accounts keeps the UI responsive while
+        #     the synchronous requests calls block this thread.
+        if not self.vault.accounts:
+            return
+        if not self.api_client.api_key:
+            log.info("refresh-on-launch: no API key configured, skipping")
+            return
+
+        # cache_needs_refresh covers both "TTL expired" and "schema upgrade
+        # since last fetch" — the second is what makes the first launch after
+        # a feature bump (like adding flex rank) backfill all rows.
+        stale = [a for a in self.vault.accounts if cache_needs_refresh(a)]
+        if not stale:
+            log.info("refresh-on-launch: all %d accounts cache-fresh + schema-current, skipping",
+                     len(self.vault.accounts))
+            return
+
+        log.info("refresh-on-launch: %d/%d accounts need a fetch",
+                 len(stale), len(self.vault.accounts))
+        had_success = False
+        had_unavailable = False
+        for account in stale:
+            try:
+                changed = refresh_rank(self.api_client, account, force=False)
+                if changed:
+                    had_success = True
+                    self.vault.update(account)
+            except ApiUnavailable as exc:
+                log.info("refresh-on-launch: api unavailable (%s)", exc)
+                had_unavailable = True
+                break
+            except RiotApiError as exc:
+                log.warning("refresh-on-launch: api error for %s#%s: %s",
+                            account.game_name, account.tag_line, exc)
+            # Yield to the Qt event loop so the window stays interactive.
+            QApplication.processEvents()
+
+        if had_unavailable:
+            self._set_api_available(False)
+        elif had_success:
+            self._set_api_available(True)
+
+        if had_success:
+            self._refresh_grid()
+            self.statusBar().showMessage(
+                f"Ranks refreshed at {time.strftime('%H:%M:%S')}", 5000
+            )
+
+        # Now that icon IDs are populated (refresh_rank wrote them), download
+        # any profile icon PNGs that aren't on disk yet. Tiny files, but go
+        # one at a time with processEvents so the window stays interactive.
+        self._download_missing_profile_icons()
+
+    def _download_missing_profile_icons(self) -> None:
+        # Eager fetch for the avatar block on each card. Skips icons that are
+        # already on disk. Silent on per-icon failure — the card just renders
+        # the first-letter fallback until next launch. DDragon is unauthed
+        # so this works even if the Riot Web API key is missing/expired.
+        new_pngs = False
+        for account in list(self.vault.accounts):
+            icon_id = account.cached_profile_icon_id
+            if icon_id is None:
+                continue
+            local = profile_icon_local_path(icon_id)
+            if local.exists() and local.stat().st_size > 0:
+                continue
+            log.info("downloading profile icon %d for %s#%s",
+                     icon_id, account.game_name, account.tag_line)
+            path = ensure_profile_icon(icon_id)
+            if path is not None:
+                new_pngs = True
+            QApplication.processEvents()
+        if new_pngs:
+            # Drop any pre-existing fallback pixmaps so the next grid render
+            # picks up the freshly-downloaded PNGs instead of stale "?" disks.
+            clear_profile_icon_pixmap_cache()
+            self._refresh_grid()
+
     def _on_refresh_clicked(self) -> None:
         # Refresh every account's rank. Silent on per-account failures (we
         # just leave the cached data alone). The banner shows up if any
@@ -443,6 +620,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Ranks refreshed at {time.strftime('%H:%M:%S')}", 5000
             )
+            # Catch any icon IDs that changed since last launch (user picked a
+            # new profile icon in-game). No-op when nothing new is missing.
+            self._download_missing_profile_icons()
 
     def _on_refresh_one(self, account_id: str) -> None:
         log.info("refresh-one for account_id=%s", account_id)
@@ -528,7 +708,7 @@ class MainWindow(QMainWindow):
             try:
                 self._reload_api_client()
                 try:
-                    info = self.api_client.fetch_rank(candidate)
+                    ranks = self.api_client.fetch_rank(candidate)
                 except RiotIdNotFound:
                     # Bad Riot ID is a user error, NOT an API outage. Don't flip
                     # the banner — just tell the user the ID is wrong.
@@ -543,14 +723,16 @@ class MainWindow(QMainWindow):
                     return VerifyResult(False, f"Riot API error: {exc}")
 
                 self._set_api_available(True)
-                if info.tier is None:
-                    return VerifyResult(True, "Riot ID found. Account is unranked.")
-                bits = [info.tier.title()]
-                if info.division:
-                    bits.append(info.division)
-                if info.lp is not None:
-                    bits.append(f"{info.lp} LP")
-                return VerifyResult(True, "Found: " + " ".join(bits))
+                # Both queues unranked -> single-line message.
+                if ranks.solo.tier is None and ranks.flex.tier is None:
+                    return VerifyResult(True,
+                                        "Riot ID found. Unranked in both queues.")
+                solo_str = _format_rank_one_line(ranks.solo)
+                flex_str = _format_rank_one_line(ranks.flex)
+                return VerifyResult(
+                    True,
+                    f"Found. Solo: {solo_str} / Flex: {flex_str}",
+                )
             except Exception as exc:
                 # Catch-all so a bug in the verify path can't crash PyQt6.
                 # Logged with traceback so we can debug after the fact.

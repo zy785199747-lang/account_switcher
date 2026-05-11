@@ -26,11 +26,33 @@ class Account:
     # and league-v4 endpoints in Phase 3.
     region: str = "na1"
 
+    # Free-text reminder shown on the card under the region. Helpful when
+    # several accounts share similar Riot IDs ("main", "smurf", "ARAM only").
+    note: str = ""
+
     # Cached rank fields — populated by Riot API in Phase 3.
+    # The unprefixed fields are solo-queue (RANKED_SOLO_5x5); the flex_*
+    # variants are flex-queue (RANKED_FLEX_SR). Both come from the same
+    # league-v4 by-puuid response so fetching both is free.
     cached_tier: Optional[str] = None
     cached_division: Optional[str] = None
     cached_lp: Optional[int] = None
+    cached_flex_tier: Optional[str] = None
+    cached_flex_division: Optional[str] = None
+    cached_flex_lp: Optional[int] = None
     cached_at: Optional[float] = None  # epoch seconds
+
+    # Profile icon ID from summoner-v4. The Data Dragon CDN converts this
+    # number into an actual PNG (see src/riot/ddragon.py). None = not
+    # fetched yet OR the summoner-v4 call failed.
+    cached_profile_icon_id: Optional[int] = None
+
+    # Schema version of the cached_* block. Old vaults default to 1 (solo
+    # only). Schema 2 adds flex; schema 3 adds the profile icon ID. Bump on
+    # future schema changes and the refresh logic will force a re-fetch even
+    # when the TTL has not yet expired, so users see fresh data immediately
+    # after upgrading.
+    cached_schema: int = 1
 
     def to_dict(self) -> dict:
         # Used when serialising the vault to JSON before encryption.

@@ -146,6 +146,13 @@ class AddAccountDialog(QDialog):
             self.region.addItem(label)
         form.addRow("Region:", self.region)
 
+        # Optional one-line note. Lives on the card under the region so the
+        # user can tell similar Riot IDs apart at a glance ("main", "smurf").
+        self.note = QLineEdit()
+        self.note.setPlaceholderText("Optional (e.g. main, smurf, ARAM only)")
+        self.note.setMaxLength(80)  # keep it short — the card has limited room
+        form.addRow("Note:", self.note)
+
         outer.addLayout(form)
 
         # Inline error label, hidden until validation fails.
@@ -211,6 +218,7 @@ class AddAccountDialog(QDialog):
         self.game_name.setText(a.game_name)
         self.tag_line.setText(a.tag_line)
         self._set_region_code(a.region)
+        self.note.setText(a.note)
 
     # ---------- accept ----------
 
@@ -253,6 +261,7 @@ class AddAccountDialog(QDialog):
             game_name=game_name,
             tag_line=tag_line,
             region=self._selected_region_code(),
+            note=self.note.text().strip(),
         )
 
     def _on_verify(self) -> None:
@@ -305,10 +314,15 @@ class AddAccountDialog(QDialog):
                 game_name=candidate.game_name,
                 tag_line=candidate.tag_line,
                 region=candidate.region,
+                note=candidate.note,
                 cached_tier=self._editing.cached_tier,
                 cached_division=self._editing.cached_division,
                 cached_lp=self._editing.cached_lp,
+                cached_flex_tier=self._editing.cached_flex_tier,
+                cached_flex_division=self._editing.cached_flex_division,
+                cached_flex_lp=self._editing.cached_flex_lp,
                 cached_at=self._editing.cached_at,
+                cached_schema=self._editing.cached_schema,
             )
             log.info("dialog accepted: edit account id=%s", self._editing.id)
 
