@@ -21,6 +21,8 @@ LATEST_RELEASE_API = (
 RELEASES_URL = f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest"
 APPDATA_DIR_NAME = "RiotAccountSwitcher"
 DOWNLOAD_TIMEOUT_SECONDS = 30
+UPDATE_NOTES_MAX_LINES = 2
+UPDATE_NOTES_MAX_CHARS = 500
 
 log = logging.getLogger(__name__)
 
@@ -193,9 +195,31 @@ def install_downloaded_update(downloaded_exe: Path) -> None:
     )
 
 
+def _short_release_notes(body: str) -> str:
+    lines: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        lines.append(line)
+        if len(lines) >= UPDATE_NOTES_MAX_LINES:
+            break
+
+    notes = "\n".join(lines)
+    if len(notes) <= UPDATE_NOTES_MAX_CHARS:
+        return notes
+    return notes[:UPDATE_NOTES_MAX_CHARS].rstrip() + "..."
+
+
 def format_update_summary(info: UpdateInfo) -> str:
-    return (
+    summary = (
         f"Version {info.latest_version} is available.\n\n"
         f"Current version: {info.current_version}\n"
         f"Asset: {info.asset_name}"
     )
+    notes = _short_release_notes(info.body)
+    if notes:
+        summary += f"\n\nWhat's new:\n{notes}"
+    return summary

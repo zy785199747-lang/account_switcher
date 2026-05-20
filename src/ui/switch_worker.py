@@ -17,12 +17,15 @@
 #      Python doesn't leak.
 
 import logging
+import threading
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from src.riot.launcher import (
     AUTO_FILL_CLIPBOARD,
     LauncherError,
+    SwitchCancelled,
+    kill_riot_processes,
     switch_account,
 )
 
@@ -36,6 +39,8 @@ class SwitchWorker(QObject):
     finished = pyqtSignal(str)
     # Emitted on any failure with a human-friendly message.
     failed = pyqtSignal(str)
+    # Emitted when the user stops the active switch.
+    cancelled = pyqtSignal()
 
     def __init__(self, username: str, password: str, install_path: str,
                  auto_fill_mode: str = AUTO_FILL_CLIPBOARD,
@@ -46,6 +51,15 @@ class SwitchWorker(QObject):
         self._install_path = install_path
         self._auto_fill_mode = auto_fill_mode
         self._riot_id = riot_id
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        log.info("switch cancellation requested")
+        self._cancel_event.set()
+        try:
+            kill_riot_processes(timeout=0.5)
+        except Exception:
+            log.exception("failed to kill Riot processes during cancellation")
 
     def run(self) -> None:
         # Runs on the worker thread. Never throw — convert all exceptions to
@@ -57,12 +71,24 @@ class SwitchWorker(QObject):
                 install_path=self._install_path,
                 auto_fill_mode=self._auto_fill_mode,
                 progress=self._emit_progress,
+                cancel_check=self._cancel_event.is_set,
             )
             self.finished.emit(self._riot_id)
+        except SwitchCancelled:
+            log.info("switch cancelled")
+            self.cancelled.emit()
         except LauncherError as exc:
+            if self._cancel_event.is_set():
+                log.info("switch stopped after cancellation: %s", exc)
+                self.cancelled.emit()
+                return
             log.info("switch failed: %s", exc)
             self.failed.emit(str(exc))
         except Exception as exc:
+            if self._cancel_event.is_set():
+                log.info("switch stopped after cancellation: %s", exc)
+                self.cancelled.emit()
+                return
             # Anything else is genuinely unexpected; log full traceback.
             log.exception("switch worker crashed")
             self.failed.emit(f"Internal error: {exc}")

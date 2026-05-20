@@ -8,6 +8,7 @@ from src.riot.launcher import (
     TYPE_FOCUS_SETTLE_SECONDS,
     TYPE_SUBMIT_SETTLE_SECONDS,
     PYWINAUTO_FOCUS_FALLBACK_SECONDS,
+    USERNAME_VERIFY_FOCUS_RETRY_SECONDS,
     USERNAME_VERIFY_RETRY_SECONDS,
     USERNAME_VERIFY_TIMEOUT_SECONDS,
     _escape_for_send_keys,
@@ -109,8 +110,33 @@ def test_autofill_focus_timing_is_not_six_second_pause():
     assert TYPE_FIELD_SETTLE_SECONDS <= 0.10
     assert TYPE_SUBMIT_SETTLE_SECONDS <= 0.05
     assert PYWINAUTO_FOCUS_FALLBACK_SECONDS <= 0.75
+    assert USERNAME_VERIFY_FOCUS_RETRY_SECONDS <= 0.4
     assert USERNAME_VERIFY_RETRY_SECONDS <= 0.15
     assert USERNAME_VERIFY_TIMEOUT_SECONDS <= 6.0
+
+
+def test_username_paste_retry_does_not_tab_away(monkeypatch):
+    import src.riot.launcher as launcher
+
+    sent_keys = []
+
+    monkeypatch.setattr(launcher, "USERNAME_VERIFY_TIMEOUT_SECONDS", 0.18)
+    monkeypatch.setattr(launcher, "USERNAME_VERIFY_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(launcher, "USERNAME_VERIFY_FOCUS_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(launcher, "_paste_text", lambda _text: None)
+    monkeypatch.setattr(launcher, "_focused_text_equals", lambda _text: False)
+    monkeypatch.setattr(launcher, "focus_riot_window", lambda window, timeout: window)
+    monkeypatch.setattr(
+        launcher.pwa_keyboard,
+        "send_keys",
+        lambda keys, **_kwargs: sent_keys.append(keys),
+    )
+
+    with pytest.raises(launcher.LauncherError):
+        launcher._paste_username_verified("TestUser", _FakeWindow())
+
+    assert "{TAB}" not in sent_keys
+    assert "^a{DELETE}" in sent_keys
 
 
 def test_switch_worker_constructs():
@@ -133,6 +159,7 @@ def test_switch_worker_signals():
     assert hasattr(worker, "progress")
     assert hasattr(worker, "finished")
     assert hasattr(worker, "failed")
+    assert hasattr(worker, "cancelled")
 
 
 def test_main_window_switch_plumbing():
@@ -147,3 +174,8 @@ def test_main_window_switch_plumbing():
     assert "SwitchWorker" in source
     assert "_switch_thread" in source
     assert "_switch_worker" in source
+    assert "Stop switch" in source
+    assert "_on_switch_cancel_requested" in source
+    assert "_switch_cancel_requested = True" in inspect.getsource(
+        MainWindow._on_switch_finished
+    )

@@ -104,6 +104,8 @@ PASTE_TAB_SETTLE_SECONDS = 0.08
 FOCUS_RETRY_SECONDS = 2.0
 FOCUS_RETRY_INTERVAL = 0.05
 PYWINAUTO_FOCUS_FALLBACK_SECONDS = 0.75
+USERNAME_VERIFY_FOCUS_RETRY_SECONDS = 0.4
+FALLBACK_WINDOW_REFRESH_SECONDS = 5.0
 
 AUTO_FILL_CLIPBOARD = "clipboard"
 AUTO_FILL_TYPING = "typing"
@@ -136,16 +138,31 @@ class PywinautoUnavailable(LauncherError):
     pass
 
 
+class SwitchCancelled(LauncherError):
+    # User requested that the active switch stop.
+    pass
+
+
 # ---------- progress callback type ----------
 
 # A simple callback the worker can use to push status messages to the UI
 # without coupling the launcher to PyQt. The worker (Phase 4) will pass a
 # QtSignal-emitting wrapper.
 ProgressCb = Callable[[str], None]
+CancelCheck = Callable[[], bool]
 
 
 def _noop_progress(_msg: str) -> None:
     pass
+
+
+def _not_cancelled() -> bool:
+    return False
+
+
+def _raise_if_cancelled(cancel_check: CancelCheck = _not_cancelled) -> None:
+    if cancel_check():
+        raise SwitchCancelled("Switch cancelled.")
 
 
 # ---------- process management ----------
@@ -339,7 +356,10 @@ def launch_riot_client(
 
 # ---------- window detection ----------
 
-def wait_for_login_window(timeout: float = WINDOW_WAIT_SECONDS):
+def wait_for_login_window(
+    timeout: float = WINDOW_WAIT_SECONDS,
+    cancel_check: CancelCheck = _not_cancelled,
+):
     # Polls pywinauto until a window matching RIOT_WINDOW_TITLE_REGEX appears.
     # Returns the wrapped window object.
     if not PYWINAUTO_AVAILABLE:
@@ -351,6 +371,7 @@ def wait_for_login_window(timeout: float = WINDOW_WAIT_SECONDS):
     deadline = time.monotonic() + timeout
     last_err: Optional[Exception] = None
     while time.monotonic() < deadline:
+        _raise_if_cancelled(cancel_check)
         try:
             app = pywinauto.Application(backend="uia").connect(
                 title_re=RIOT_WINDOW_TITLE_REGEX, timeout=1
@@ -370,7 +391,10 @@ def wait_for_login_window(timeout: float = WINDOW_WAIT_SECONDS):
     )
 
 
-def wait_for_login_window_fast(timeout: float = WINDOW_WAIT_SECONDS):
+def wait_for_login_window_fast(
+    timeout: float = WINDOW_WAIT_SECONDS,
+    cancel_check: CancelCheck = _not_cancelled,
+):
     # Faster probe than Application.connect(timeout=1): scan the desktop
     # window tree without spending a full second on each failed poll. Try the
     # lighter Win32 backend first because we only need the top-level native
@@ -384,6 +408,7 @@ def wait_for_login_window_fast(timeout: float = WINDOW_WAIT_SECONDS):
     deadline = time.monotonic() + timeout
     last_err: Optional[Exception] = None
     while time.monotonic() < deadline:
+        _raise_if_cancelled(cancel_check)
         window = _visible_riot_native_window()
         if window is not None:
             log.info("Riot Client window detected via native")
@@ -532,8 +557,11 @@ def _visible_riot_window_probe(backend: str):
     return None
 
 
-def focus_riot_window(initial_window=None,
-                      timeout: float = FOCUS_RETRY_SECONDS):
+def focus_riot_window(
+    initial_window=None,
+    timeout: float = FOCUS_RETRY_SECONDS,
+    cancel_check: CancelCheck = _not_cancelled,
+):
     # Focus must actually succeed before we send Ctrl+V or keystrokes.
     # Returning a focused, freshly-valid wrapper is better than continuing
     # after set_focus() fails and pretending the login worked.
@@ -542,6 +570,7 @@ def focus_riot_window(initial_window=None,
     last_err: Optional[Exception] = None
 
     while time.monotonic() < deadline:
+        _raise_if_cancelled(cancel_check)
         if initial_window is not None:
             if _focus_window_native(initial_window):
                 log.info("Riot Client window focused via detected native")
@@ -728,7 +757,12 @@ def _escape_for_send_keys(text: str) -> str:
     return "".join(out_chunks)
 
 
-def type_credentials(window, username: str, password: str) -> None:
+def type_credentials(
+    window,
+    username: str,
+    password: str,
+    cancel_check: CancelCheck = _not_cancelled,
+) -> None:
     # Type username and password into Riot Client login form.
     # Riot Client uses Chromium, so we can't find Edit controls via pywinauto.
     # We rely on the window being focused and the username field having focus
@@ -737,23 +771,29 @@ def type_credentials(window, username: str, password: str) -> None:
         raise PywinautoUnavailable("pywinauto not available")
 
     log.info("focusing Riot Client window")
-    window = focus_riot_window(window)
+    window = focus_riot_window(window, cancel_check=cancel_check)
 
     time.sleep(TYPE_FOCUS_SETTLE_SECONDS)
+    _raise_if_cancelled(cancel_check)
 
-    # Type username. Assume the username field is focused (Riot Client opens with it focused).
+    # Type username. Assume the username field is focused (Riot Client opens
+    # with it focused), but clear first so a retry never appends to stale text.
     log.info("typing username (length=%d)", len(username))
+    pwa_keyboard.send_keys("^a{DELETE}", pause=0.01, vk_packet=False)
+    time.sleep(TYPE_FIELD_SETTLE_SECONDS)
     escaped_username = _escape_for_send_keys(username)
     log.debug("escaped username: %s", escaped_username)
     pwa_keyboard.send_keys(escaped_username,
                            with_spaces=True, pause=0.08)
     log.info("username sent to focused field")
     time.sleep(TYPE_FIELD_SETTLE_SECONDS)
+    _raise_if_cancelled(cancel_check)
 
     # Tab to password field
     log.info("tabbing to password field")
     pwa_keyboard.send_keys("{TAB}", pause=0.08)
     time.sleep(TYPE_FIELD_SETTLE_SECONDS)
+    _raise_if_cancelled(cancel_check)
 
     # Type password
     log.info("typing password (length=%d)", len(password))
@@ -763,6 +803,7 @@ def type_credentials(window, username: str, password: str) -> None:
                            with_spaces=True, pause=0.08)
     log.info("password sent to focused field")
     time.sleep(TYPE_SUBMIT_SETTLE_SECONDS)
+    _raise_if_cancelled(cancel_check)
 
     # Submit
     pwa_keyboard.send_keys("{ENTER}", pause=0.08)
@@ -788,9 +829,9 @@ def _set_clipboard_text(text: str) -> None:
             pwa_clipboard.win32clipboard.OpenClipboard()
             try:
                 pwa_clipboard.win32clipboard.EmptyClipboard()
-                pwa_clipboard.win32clipboard.SetClipboardData(
-                    pwa_clipboard.win32clipboard.CF_UNICODETEXT,
+                pwa_clipboard.win32clipboard.SetClipboardText(
                     text,
+                    pwa_clipboard.win32clipboard.CF_UNICODETEXT,
                 )
                 return
             finally:
@@ -818,13 +859,22 @@ def _focused_text_equals(expected: str) -> bool:
     return _clipboard_text() == expected
 
 
-def _paste_username_verified(username: str) -> None:
+def _paste_username_verified(
+    username: str,
+    window=None,
+    cancel_check: CancelCheck = _not_cancelled,
+):
     # This is the important readiness check. Window stability and focus are
     # only proxies; confirming that Ctrl+A/C reads back the username proves
     # the focused control is the username field and that paste actually landed.
+    #
+    # Do not TAB around during retries. Failed attempts usually mean Riot's
+    # CEF login form is not ready yet; blind tabbing can leave the fallback
+    # typing path in an unknown field.
     deadline = time.monotonic() + USERNAME_VERIFY_TIMEOUT_SECONDS
     attempt = 0
     while time.monotonic() < deadline:
+        _raise_if_cancelled(cancel_check)
         attempt += 1
         pwa_keyboard.send_keys("^a{DELETE}", pause=0.01)
         _paste_text(username)
@@ -833,13 +883,25 @@ def _paste_username_verified(username: str) -> None:
             return
 
         log.debug("username paste verification failed on attempt %d", attempt)
-        pwa_keyboard.send_keys("{TAB}", pause=0.01)
+        try:
+            window = focus_riot_window(
+                window,
+                timeout=USERNAME_VERIFY_FOCUS_RETRY_SECONDS,
+                cancel_check=cancel_check,
+            )
+        except Exception as exc:
+            log.debug("username paste retry focus failed: %s", exc)
         time.sleep(USERNAME_VERIFY_RETRY_SECONDS)
 
     raise LauncherError("username field did not accept clipboard paste")
 
 
-def paste_credentials(window, username: str, password: str) -> None:
+def paste_credentials(
+    window,
+    username: str,
+    password: str,
+    cancel_check: CancelCheck = _not_cancelled,
+) -> None:
     # Faster and less visibly leaky than type_credentials(). We still need
     # Riot Client focused because the login form lives inside a CEF webview,
     # but this reduces the focus-sensitive window to a couple of paste events.
@@ -847,21 +909,25 @@ def paste_credentials(window, username: str, password: str) -> None:
         raise PywinautoUnavailable("pywinauto not available")
 
     log.info("focusing Riot Client window for clipboard fill")
-    window = focus_riot_window(window)
+    window = focus_riot_window(window, cancel_check=cancel_check)
 
     time.sleep(PASTE_FOCUS_SETTLE_SECONDS)
+    _raise_if_cancelled(cancel_check)
     original_clipboard = _clipboard_text()
     try:
         log.info("pasting username (length=%d)", len(username))
-        _paste_username_verified(username)
+        _paste_username_verified(username, window, cancel_check=cancel_check)
+        _raise_if_cancelled(cancel_check)
 
         log.info("tabbing to password field")
         pwa_keyboard.send_keys("{TAB}", pause=0.01)
         time.sleep(PASTE_TAB_SETTLE_SECONDS)
+        _raise_if_cancelled(cancel_check)
 
         log.info("pasting password (length=%d)", len(password))
         pwa_keyboard.send_keys("^a{DELETE}", pause=0.01)
         _paste_text(password)
+        _raise_if_cancelled(cancel_check)
 
         pwa_keyboard.send_keys("{ENTER}", pause=0.01)
         log.info("credentials pasted")
@@ -875,19 +941,31 @@ def paste_credentials(window, username: str, password: str) -> None:
 
 def fill_credentials(window, username: str, password: str,
                      auto_fill_mode: str = AUTO_FILL_CLIPBOARD,
-                     progress: ProgressCb = _noop_progress) -> None:
+                     progress: ProgressCb = _noop_progress,
+                     cancel_check: CancelCheck = _not_cancelled) -> None:
     mode = auto_fill_mode if auto_fill_mode in AUTO_FILL_MODES else AUTO_FILL_CLIPBOARD
     log.info("auto-fill mode selected: %s", mode)
+    _raise_if_cancelled(cancel_check)
     if mode == AUTO_FILL_TYPING:
-        type_credentials(window, username, password)
+        type_credentials(window, username, password, cancel_check=cancel_check)
         return
 
     try:
-        paste_credentials(window, username, password)
+        paste_credentials(window, username, password, cancel_check=cancel_check)
     except Exception as exc:
+        _raise_if_cancelled(cancel_check)
         log.warning("clipboard fill failed; falling back to typing: %s", exc)
         progress("Paste failed; typing credentials...")
-        type_credentials(window, username, password)
+        try:
+            window = wait_for_login_window_fast(
+                timeout=FALLBACK_WINDOW_REFRESH_SECONDS,
+                cancel_check=cancel_check,
+            )
+        except Exception as refresh_exc:
+            _raise_if_cancelled(cancel_check)
+            log.debug("could not refresh Riot window before typing fallback: %s",
+                      refresh_exc)
+        type_credentials(window, username, password, cancel_check=cancel_check)
 
 
 # ---------- top-level orchestrator ----------
@@ -899,6 +977,7 @@ def switch_account(
     progress: ProgressCb = _noop_progress,
     window_timeout: float = WINDOW_WAIT_SECONDS,
     auto_fill_mode: str = AUTO_FILL_CLIPBOARD,
+    cancel_check: CancelCheck = _not_cancelled,
 ) -> None:
     # Single entry point used by SwitchWorker (Phase 4). Each step pushes a
     # progress message so the UI can show what's happening.
@@ -906,6 +985,7 @@ def switch_account(
 
     # Sanity check the install path early so we don't kill processes only to
     # discover we can't relaunch.
+    _raise_if_cancelled(cancel_check)
     if not Path(install_path).exists():
         raise RiotClientNotFound(
             f"Riot Client not found at:\n  {install_path}\n\n"
@@ -913,28 +993,38 @@ def switch_account(
         )
 
     progress("Closing Riot Client...")
+    _raise_if_cancelled(cancel_check)
     kill_riot_processes()
 
     progress("Clearing previous session...")
+    _raise_if_cancelled(cancel_check)
     clear_riot_session()
 
     progress("Launching Riot Client...")
+    _raise_if_cancelled(cancel_check)
     launch_riot_client(install_path)
 
     progress("Waiting for login window...")
-    window = wait_for_login_window_fast(timeout=window_timeout)
+    _raise_if_cancelled(cancel_check)
+    window = wait_for_login_window_fast(
+        timeout=window_timeout,
+        cancel_check=cancel_check,
+    )
 
     if auto_fill_mode == AUTO_FILL_TYPING:
         progress("Typing credentials...")
     else:
         progress("Pasting credentials...")
+    _raise_if_cancelled(cancel_check)
     fill_credentials(
         window,
         username,
         password,
         auto_fill_mode=auto_fill_mode,
         progress=progress,
+        cancel_check=cancel_check,
     )
 
+    _raise_if_cancelled(cancel_check)
     progress("Logged in.")
     log.info("switch_account: complete")

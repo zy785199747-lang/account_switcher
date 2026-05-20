@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QPushButton,
     QScrollArea,
     QToolBar,
     QVBoxLayout,
@@ -124,6 +125,8 @@ class MainWindow(QMainWindow):
         self._switch_thread: Optional[QThread] = None
         self._switch_worker: Optional[SwitchWorker] = None
         self._switch_dialog: Optional[QProgressDialog] = None
+        self._switch_cancel_button: Optional[QPushButton] = None
+        self._switch_cancel_requested = False
         self._update_thread: Optional[QThread] = None
         self._update_worker: Optional[UpdateWorker] = None
         self._update_manual = False
@@ -606,15 +609,18 @@ class MainWindow(QMainWindow):
             log.info("switch aborted: no install path available")
             return
 
-        # Progress dialog — modal, no cancel button (cancelling mid-launch is
-        # messy; user can close the Riot Client manually if needed).
+        self._switch_cancel_requested = False
+        # Progress dialog. The stop button is intentionally available because
+        # Riot/CEF startup can wedge outside our process.
         self._switch_dialog = QProgressDialog(
             f"Switching to {riot_id}...", "", 0, 0, self
         )
         self._switch_dialog.setWindowTitle("Switching account")
-        self._switch_dialog.setCancelButton(None)  # type: ignore[arg-type]
+        self._switch_cancel_button = QPushButton("Stop switch", self._switch_dialog)
+        self._switch_dialog.setCancelButton(self._switch_cancel_button)
         self._switch_dialog.setMinimumDuration(0)
         self._switch_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._switch_dialog.canceled.connect(self._on_switch_cancel_requested)
         self._switch_dialog.show()
 
         # Build worker + thread.
@@ -634,9 +640,11 @@ class MainWindow(QMainWindow):
         self._switch_worker.progress.connect(self._on_switch_progress)
         self._switch_worker.finished.connect(self._on_switch_finished)
         self._switch_worker.failed.connect(self._on_switch_failed)
+        self._switch_worker.cancelled.connect(self._on_switch_cancelled)
         # Both terminal signals stop the thread.
         self._switch_worker.finished.connect(self._switch_thread.quit)
         self._switch_worker.failed.connect(self._switch_thread.quit)
+        self._switch_worker.cancelled.connect(self._switch_thread.quit)
         # When the thread is fully stopped, drop our refs so the next switch can run.
         self._switch_thread.finished.connect(self._on_switch_thread_finished)
         self._switch_thread.start()
@@ -649,9 +657,11 @@ class MainWindow(QMainWindow):
 
     def _on_switch_finished(self, riot_id: str) -> None:
         log.info("switch finished successfully for %s", riot_id)
+        self._switch_cancel_requested = True
         if self._switch_dialog is not None:
             self._switch_dialog.close()
             self._switch_dialog = None
+        self._switch_cancel_button = None
         if riot_id:
             self._show_status(f"Logged in as {riot_id}.", 5000)
         else:
@@ -659,11 +669,35 @@ class MainWindow(QMainWindow):
 
     def _on_switch_failed(self, msg: str) -> None:
         log.info("switch failed: %s", msg)
+        self._switch_cancel_requested = True
         if self._switch_dialog is not None:
             self._switch_dialog.close()
             self._switch_dialog = None
+        self._switch_cancel_button = None
         self._show_status("Switch failed.", 5000)
         QMessageBox.critical(self, "Switch failed", msg)
+
+    def _on_switch_cancel_requested(self) -> None:
+        if self._switch_worker is None or self._switch_cancel_requested:
+            return
+        log.info("switch stop requested by user")
+        self._switch_cancel_requested = True
+        if self._switch_dialog is not None:
+            self._switch_dialog.setLabelText("Stopping switch...")
+        if self._switch_cancel_button is not None:
+            self._switch_cancel_button.setEnabled(False)
+            self._switch_cancel_button.setText("Stopping...")
+        self._show_status("Stopping switch...")
+        self._switch_worker.cancel()
+
+    def _on_switch_cancelled(self) -> None:
+        log.info("switch cancelled by user")
+        self._switch_cancel_requested = True
+        if self._switch_dialog is not None:
+            self._switch_dialog.close()
+            self._switch_dialog = None
+        self._switch_cancel_button = None
+        self._show_status("Switch stopped.", 5000)
 
     def _on_switch_thread_finished(self) -> None:
         # Final cleanup. Runs after the QThread's event loop has stopped.
@@ -673,6 +707,7 @@ class MainWindow(QMainWindow):
         if self._switch_thread is not None:
             self._switch_thread.deleteLater()
             self._switch_thread = None
+        self._switch_cancel_requested = False
 
     def closeEvent(self, event) -> None:
         if self._switch_thread is not None and self._switch_thread.isRunning():
