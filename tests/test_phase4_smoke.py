@@ -7,11 +7,14 @@ from src.riot.launcher import (
     TYPE_FIELD_SETTLE_SECONDS,
     TYPE_FOCUS_SETTLE_SECONDS,
     TYPE_SUBMIT_SETTLE_SECONDS,
+    WINDOW_CLOSE_WAIT_SECONDS,
+    PYWINAUTO_WINDOW_PROBE_SECONDS,
     PYWINAUTO_FOCUS_FALLBACK_SECONDS,
     USERNAME_VERIFY_FOCUS_RETRY_SECONDS,
     USERNAME_VERIFY_RETRY_SECONDS,
     USERNAME_VERIFY_TIMEOUT_SECONDS,
     _escape_for_send_keys,
+    _last_visible_riot_window_cancellable,
     _last_visible_riot_window,
     find_riot_processes,
     RIOT_PROCESS_NAMES,
@@ -28,6 +31,7 @@ def test_launcher_module_imports():
         RiotWindowNotFound,
         PywinautoUnavailable,
         kill_riot_processes,
+        wait_for_riot_windows_to_close,
         clear_riot_session,
         launch_riot_client,
         wait_for_login_window,
@@ -35,6 +39,7 @@ def test_launcher_module_imports():
         switch_account,
     )
     assert callable(switch_account)
+    assert callable(wait_for_riot_windows_to_close)
 
 
 def test_send_keys_escape():
@@ -104,6 +109,8 @@ def test_last_visible_riot_window_falls_back_to_direct_probe(monkeypatch):
 
 def test_autofill_focus_timing_is_not_six_second_pause():
     assert WINDOW_POLL_INTERVAL <= 0.10
+    assert WINDOW_CLOSE_WAIT_SECONDS <= 3.0
+    assert PYWINAUTO_WINDOW_PROBE_SECONDS <= 2.0
     assert FOCUS_RETRY_INTERVAL <= 0.05
     assert FOCUS_RETRY_SECONDS <= 2.0
     assert TYPE_FOCUS_SETTLE_SECONDS <= 0.20
@@ -137,6 +144,44 @@ def test_username_paste_retry_does_not_tab_away(monkeypatch):
 
     assert "{TAB}" not in sent_keys
     assert "^a{DELETE}" in sent_keys
+
+
+def test_wait_for_riot_windows_to_close_waits_until_no_window(monkeypatch):
+    import src.riot.launcher as launcher
+
+    windows = [_FakeWindow(), _FakeWindow(), None]
+
+    monkeypatch.setattr(launcher, "PYWINAUTO_AVAILABLE", True)
+    monkeypatch.setattr(launcher, "WINDOW_POLL_INTERVAL", 0)
+    monkeypatch.setattr(launcher, "_visible_riot_native_window", lambda: windows.pop(0))
+
+    assert launcher.wait_for_riot_windows_to_close(timeout=1.0)
+
+
+def test_window_probe_cancellation_does_not_wait_for_probe_timeout(monkeypatch):
+    import threading
+    import time
+    import src.riot.launcher as launcher
+
+    cancel_event = threading.Event()
+
+    def slow_probe(_backend):
+        cancel_event.set()
+        time.sleep(0.2)
+        return None
+
+    monkeypatch.setattr(launcher, "_last_visible_riot_window", slow_probe)
+    monkeypatch.setattr(launcher, "WINDOW_POLL_INTERVAL", 0.01)
+
+    started = time.monotonic()
+    with pytest.raises(launcher.SwitchCancelled):
+        _last_visible_riot_window_cancellable(
+            "uia",
+            cancel_check=cancel_event.is_set,
+            timeout=1.0,
+        )
+
+    assert time.monotonic() - started < 0.15
 
 
 def test_switch_worker_constructs():

@@ -23,9 +23,11 @@
 
 import logging
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -86,8 +88,10 @@ RIOT_WINDOW_TITLE_REGEX = "Riot Client.*"
 
 # Time budgets.
 KILL_WAIT_SECONDS = 5.0      # how long to wait for processes to actually exit
+WINDOW_CLOSE_WAIT_SECONDS = 3.0  # wait for old visible windows to disappear
 WINDOW_WAIT_SECONDS = 60.0   # how long we'll wait for the login window
 WINDOW_POLL_INTERVAL = 0.10
+PYWINAUTO_WINDOW_PROBE_SECONDS = 2.0
 USERNAME_VERIFY_TIMEOUT_SECONDS = 6.0
 USERNAME_VERIFY_RETRY_SECONDS = 0.15
 FOCUS_SETTLE_SECONDS = 0.6   # let the field be ready after set_focus
@@ -204,6 +208,29 @@ def kill_riot_processes(timeout: float = KILL_WAIT_SECONDS) -> int:
     if remaining:
         log.warning("after %.1fs, %d Riot processes still running", timeout, len(remaining))
     return len(procs)
+
+
+def wait_for_riot_windows_to_close(
+    timeout: float = WINDOW_CLOSE_WAIT_SECONDS,
+    cancel_check: CancelCheck = _not_cancelled,
+) -> bool:
+    # A killed RiotClientServices.exe can leave its top-level window visible
+    # for a short moment. If we relaunch immediately, the window detector can
+    # grab that stale surface and paste credentials into a client that is
+    # still shutting down.
+    if not PYWINAUTO_AVAILABLE:
+        return True
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _raise_if_cancelled(cancel_check)
+        if _visible_riot_native_window() is None:
+            log.info("old Riot Client windows closed")
+            return True
+        time.sleep(WINDOW_POLL_INTERVAL)
+
+    log.warning("old Riot Client window still visible after %.1fs", timeout)
+    return False
 
 
 # ---------- session clearing ----------
@@ -415,19 +442,57 @@ def wait_for_login_window_fast(
             return window
 
         for backend in ("win32", "uia"):
-            try:
-                window = _last_visible_riot_window(backend)
-                if window is not None:
-                    log.info("Riot Client window detected via %s", backend)
-                    return window
-            except Exception as exc:
-                last_err = exc
+            _raise_if_cancelled(cancel_check)
+            window, err = _last_visible_riot_window_cancellable(
+                backend,
+                cancel_check=cancel_check,
+            )
+            if err is not None:
+                last_err = err
+            if window is not None:
+                log.info("Riot Client window detected via %s", backend)
+                return window
         time.sleep(WINDOW_POLL_INTERVAL)
 
     raise RiotWindowNotFound(
         f"Riot Client window did not appear within {timeout:.0f}s "
         f"(last error: {last_err})"
     )
+
+
+def _last_visible_riot_window_cancellable(
+    backend: str,
+    cancel_check: CancelCheck = _not_cancelled,
+    timeout: float = PYWINAUTO_WINDOW_PROBE_SECONDS,
+):
+    result_queue: queue.Queue = queue.Queue(maxsize=1)
+
+    def run_probe() -> None:
+        try:
+            result_queue.put((_last_visible_riot_window(backend), None))
+        except Exception as exc:
+            result_queue.put((None, exc))
+
+    thread = threading.Thread(
+        target=run_probe,
+        name=f"riot-window-probe-{backend}",
+        daemon=True,
+    )
+    thread.start()
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _raise_if_cancelled(cancel_check)
+        try:
+            result = result_queue.get(timeout=WINDOW_POLL_INTERVAL)
+            _raise_if_cancelled(cancel_check)
+            return result
+        except queue.Empty:
+            pass
+
+    _raise_if_cancelled(cancel_check)
+    log.debug("listing Riot windows via %s timed out after %.1fs", backend, timeout)
+    return None, None
 
 
 def _iter_riot_windows():
@@ -995,6 +1060,7 @@ def switch_account(
     progress("Closing Riot Client...")
     _raise_if_cancelled(cancel_check)
     kill_riot_processes()
+    wait_for_riot_windows_to_close(cancel_check=cancel_check)
 
     progress("Clearing previous session...")
     _raise_if_cancelled(cancel_check)
