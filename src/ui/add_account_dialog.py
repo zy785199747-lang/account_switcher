@@ -14,6 +14,7 @@ from typing import Callable, Optional
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -153,6 +154,16 @@ class AddAccountDialog(QDialog):
         self.note.setMaxLength(80)  # keep it short — the card has limited room
         form.addRow("Note:", self.note)
 
+        self.tags = QLineEdit()
+        self.tags.setPlaceholderText(
+            "Optional, comma-separated (e.g. main, jungle, friends)"
+        )
+        self.tags.setMaxLength(160)
+        form.addRow("Tags:", self.tags)
+
+        self.favorite = QCheckBox("Favorite account")
+        form.addRow("", self.favorite)
+
         outer.addLayout(form)
 
         # Inline error label, hidden until validation fails.
@@ -219,6 +230,8 @@ class AddAccountDialog(QDialog):
         self.tag_line.setText(a.tag_line)
         self._set_region_code(a.region)
         self.note.setText(a.note)
+        self.tags.setText(", ".join(a.tags))
+        self.favorite.setChecked(a.favorite)
 
     # ---------- accept ----------
 
@@ -262,7 +275,20 @@ class AddAccountDialog(QDialog):
             tag_line=tag_line,
             region=self._selected_region_code(),
             note=self.note.text().strip(),
+            favorite=self.favorite.isChecked(),
+            tags=self._normalized_tags(),
         )
+
+    def _normalized_tags(self) -> list[str]:
+        tags: list[str] = []
+        seen: set[str] = set()
+        for raw in self.tags.text().split(","):
+            tag = " ".join(raw.strip().split())
+            key = tag.casefold()
+            if tag and key not in seen:
+                tags.append(tag)
+                seen.add(key)
+        return tags[:12]
 
     def _on_verify(self) -> None:
         if self._verify_callback is None:
@@ -315,6 +341,10 @@ class AddAccountDialog(QDialog):
                 tag_line=candidate.tag_line,
                 region=candidate.region,
                 note=candidate.note,
+                favorite=candidate.favorite,
+                tags=candidate.tags,
+                last_used_at=self._editing.last_used_at,
+                use_count=self._editing.use_count,
                 cached_tier=self._editing.cached_tier,
                 cached_division=self._editing.cached_division,
                 cached_lp=self._editing.cached_lp,
@@ -322,6 +352,7 @@ class AddAccountDialog(QDialog):
                 cached_flex_division=self._editing.cached_flex_division,
                 cached_flex_lp=self._editing.cached_flex_lp,
                 cached_at=self._editing.cached_at,
+                cached_profile_icon_id=self._editing.cached_profile_icon_id,
                 cached_schema=self._editing.cached_schema,
             )
             log.info("dialog accepted: edit account id=%s", self._editing.id)

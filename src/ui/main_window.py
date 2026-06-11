@@ -15,6 +15,7 @@
 
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -22,12 +23,15 @@ from PyQt6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, QUrl
 from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
@@ -79,6 +83,9 @@ CFG_LAST_API_SUCCESS = "riot_api_last_success"
 CFG_RIOT_INSTALL_PATH = "riot_install_path"
 CFG_CONFIRM_SWITCH = "confirm_switch_on_click"
 CFG_AUTO_FILL_MODE = "auto_fill_mode"
+CFG_ACCOUNT_SORT_MODE = "account_sort_mode"
+CFG_USAGE_HISTORY = "account_usage_history"
+USAGE_HISTORY_LIMIT = 100
 
 # Default for the confirm-on-switch setting when the vault has nothing saved.
 # ON by default so a misclick never tears down a running Riot session.
@@ -127,6 +134,7 @@ class MainWindow(QMainWindow):
         self._switch_dialog: Optional[QProgressDialog] = None
         self._switch_cancel_button: Optional[QPushButton] = None
         self._switch_cancel_requested = False
+        self._active_switch_account_id: Optional[str] = None
         self._update_thread: Optional[QThread] = None
         self._update_worker: Optional[UpdateWorker] = None
         self._update_manual = False
@@ -181,6 +189,10 @@ class MainWindow(QMainWindow):
         update_act.triggered.connect(self._on_check_updates_clicked)
         tb.addAction(update_act)
 
+        history_act = QAction("History", self)
+        history_act.triggered.connect(self._on_history_clicked)
+        tb.addAction(history_act)
+
         tb.addSeparator()
 
         lock_act = QAction("Lock", self)
@@ -207,6 +219,35 @@ class MainWindow(QMainWindow):
         banner_layout.addStretch(1)
         self.banner.hide()
         outer.addWidget(self.banner)
+
+        organization_row = QHBoxLayout()
+        organization_row.setContentsMargins(0, 0, 0, 0)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText(
+            "Search Riot ID, region, note, or tags..."
+        )
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._refresh_grid)
+        organization_row.addWidget(self.search_edit, 1)
+
+        self.favorites_only = QCheckBox("Favorites only")
+        self.favorites_only.toggled.connect(self._refresh_grid)
+        organization_row.addWidget(self.favorites_only)
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("Manual order", "manual")
+        self.sort_combo.addItem("Favorites first", "favorites")
+        self.sort_combo.addItem("Recently used", "recent")
+        self.sort_combo.addItem("Most used", "most_used")
+        self.sort_combo.addItem("Riot ID", "riot_id")
+        saved_sort = self.vault.get_config(CFG_ACCOUNT_SORT_MODE, "manual")
+        saved_index = self.sort_combo.findData(saved_sort)
+        self.sort_combo.setCurrentIndex(max(0, saved_index))
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        organization_row.addWidget(self.sort_combo)
+
+        outer.addLayout(organization_row)
 
         # Scrollable area that holds the grid of cards.
         self.scroll = QScrollArea()
@@ -291,7 +332,12 @@ class MainWindow(QMainWindow):
     def _refresh_grid(self) -> None:
         # Tear down existing cards and rebuild. Cheap because there will only
         # ever be a handful of accounts in practice.
-        log.debug("rebuilding card grid (%d accounts)", len(self.vault.accounts))
+        visible_accounts = self._visible_accounts()
+        log.debug(
+            "rebuilding card grid (%d/%d accounts)",
+            len(visible_accounts),
+            len(self.vault.accounts),
+        )
 
         while self.grid.count():
             self.grid.takeAt(0)
@@ -300,26 +346,116 @@ class MainWindow(QMainWindow):
             card.deleteLater()
         self._cards.clear()
 
-        if not self.vault.accounts:
+        if not visible_accounts:
             self.scroll.hide()
+            if self.vault.accounts:
+                self.empty_label.setText(
+                    "No accounts match the current search or filters."
+                )
+            else:
+                self.empty_label.setText(
+                    "No accounts yet.\nClick \"Add Account\" in the toolbar to get started."
+                )
             self.empty_label.show()
             return
 
         self.empty_label.hide()
         self.scroll.show()
 
-        for i, account in enumerate(self.vault.accounts):
-            card = AccountCard(account)
+        allow_reorder = self._is_manual_view()
+        for account in visible_accounts:
+            card = AccountCard(account, allow_reorder=allow_reorder)
             card.switch_requested.connect(self._on_switch)
             card.edit_requested.connect(self._on_edit)
             card.delete_requested.connect(self._on_delete)
             card.refresh_requested.connect(self._on_refresh_one)
+            card.favorite_requested.connect(self._on_favorite_toggled)
             card.move_requested.connect(self._on_move)
             card.drag_reorder_started.connect(self._on_card_drag_started)
             card.drag_reorder_moved.connect(self._on_card_drag_moved)
             card.drag_reorder_requested.connect(self._on_card_drag_reorder)
             self._cards.append(card)
         self._relayout_cards()
+
+    def _is_manual_view(self) -> bool:
+        return (
+            self.sort_combo.currentData() == "manual"
+            and not self.search_edit.text().strip()
+            and not self.favorites_only.isChecked()
+        )
+
+    def _visible_accounts(self) -> list[Account]:
+        query = self.search_edit.text().strip().casefold()
+        favorites_only = self.favorites_only.isChecked()
+        accounts = []
+        for account in self.vault.accounts:
+            if favorites_only and not account.favorite:
+                continue
+            searchable = " ".join([
+                account.game_name,
+                account.tag_line,
+                account.region,
+                account.note,
+                account.cached_tier or "",
+                account.cached_division or "",
+                account.cached_flex_tier or "",
+                account.cached_flex_division or "",
+                *account.tags,
+            ]).casefold()
+            if query and query not in searchable:
+                continue
+            accounts.append(account)
+
+        mode = self.sort_combo.currentData()
+        if mode == "favorites":
+            accounts.sort(key=lambda a: not a.favorite)
+        elif mode == "recent":
+            accounts.sort(key=lambda a: a.last_used_at or 0, reverse=True)
+        elif mode == "most_used":
+            accounts.sort(
+                key=lambda a: (a.use_count, a.last_used_at or 0),
+                reverse=True,
+            )
+        elif mode == "riot_id":
+            accounts.sort(
+                key=lambda a: (a.game_name.casefold(), a.tag_line.casefold())
+            )
+        return accounts
+
+    def _on_sort_changed(self, _index: int = -1) -> None:
+        mode = self.sort_combo.currentData()
+        try:
+            self.vault.set_config(CFG_ACCOUNT_SORT_MODE, mode)
+        except Exception:
+            log.exception("could not save account sort mode")
+        self._refresh_grid()
+
+    def _on_history_clicked(self) -> None:
+        history = self.vault.get_config(CFG_USAGE_HISTORY, []) or []
+        if not history:
+            QMessageBox.information(
+                self,
+                "Usage history",
+                "No successful account switches have been recorded yet.",
+            )
+            return
+
+        lines = []
+        for entry in reversed(history[-15:]):
+            try:
+                when = datetime.fromtimestamp(float(entry["used_at"]))
+                stamp = when.strftime("%Y-%m-%d %H:%M")
+            except (KeyError, TypeError, ValueError, OSError):
+                stamp = "Unknown time"
+            riot_id = str(entry.get("riot_id") or "Unknown account")
+            lines.append(f"{stamp}  {riot_id}")
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Usage history")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("Recent successful switches\n\n" + "\n".join(lines))
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
 
     def eventFilter(self, watched, event):  # type: ignore[override]
         if watched is self.scroll.viewport() and event.type() == QEvent.Type.Resize:
@@ -363,6 +499,9 @@ class MainWindow(QMainWindow):
         return before_rows + len(target_row)
 
     def _on_card_drag_reorder(self, dragged_id: str, global_pos) -> None:
+        if not self._is_manual_view():
+            self._clear_card_drag_visual()
+            return
         self._clear_card_drag_visual()
         drop_pos = self.grid_host.mapFromGlobal(global_pos)
         target_index = self._drop_index_for_position(
@@ -378,6 +517,8 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_card_drag_started(self, account_id: str, global_pos, hot_spot) -> None:
+        if not self._is_manual_view():
+            return
         card = self._find_card_widget(account_id)
         if card is None:
             return
@@ -503,6 +644,22 @@ class MainWindow(QMainWindow):
             return
         self._refresh_grid()
 
+    def _on_favorite_toggled(self, account_id: str) -> None:
+        account = self._find_account(account_id)
+        if account is None:
+            return
+        account.favorite = not account.favorite
+        try:
+            self.vault.update(account)
+        except Exception as exc:
+            account.favorite = not account.favorite
+            log.exception("could not update favorite state")
+            QMessageBox.critical(self, "Could not update favorite", str(exc))
+            return
+        self._refresh_grid()
+        state = "Added to favorites." if account.favorite else "Removed from favorites."
+        self._show_status(state, 3000)
+
     def _on_delete(self, account_id: str) -> None:
         log.info("delete clicked for account_id=%s", account_id)
         existing = self._find_account(account_id)
@@ -532,6 +689,13 @@ class MainWindow(QMainWindow):
         # Move action from context menu. For now only "reorder" is implemented.
         if action != "reorder":
             log.warning("unknown move action: %s", action)
+            return
+        if not self._is_manual_view():
+            QMessageBox.information(
+                self,
+                "Manual order unavailable",
+                "Clear search and filters, then choose Manual order to move accounts.",
+            )
             return
 
         log.info("reorder dialog requested")
@@ -588,6 +752,9 @@ class MainWindow(QMainWindow):
             note = (existing.note or "").strip()
             if note:
                 body += f"\n\nNote: {note}"
+            tags = [tag.strip() for tag in existing.tags if tag.strip()]
+            if tags:
+                body += "\n\nTags: " + ", ".join(tags)
             body += ("\n\nThis will close any running Riot Client and log "
                      "you in as this account.")
             reply = QMessageBox.question(
@@ -610,6 +777,7 @@ class MainWindow(QMainWindow):
             return
 
         self._switch_cancel_requested = False
+        self._active_switch_account_id = account_id
         # Progress dialog. The stop button is intentionally available because
         # Riot/CEF startup can wedge outside our process.
         self._switch_dialog = QProgressDialog(
@@ -657,6 +825,7 @@ class MainWindow(QMainWindow):
 
     def _on_switch_finished(self, riot_id: str) -> None:
         log.info("switch finished successfully for %s", riot_id)
+        self._record_successful_switch(riot_id)
         self._switch_cancel_requested = True
         if self._switch_dialog is not None:
             self._switch_dialog.close()
@@ -667,8 +836,36 @@ class MainWindow(QMainWindow):
         else:
             self._show_status("Logged in.", 5000)
 
+    def _record_successful_switch(self, riot_id: str) -> None:
+        account_id = self._active_switch_account_id
+        self._active_switch_account_id = None
+        if account_id is None:
+            return
+        account = self._find_account(account_id)
+        if account is None:
+            return
+
+        used_at = time.time()
+        account.last_used_at = used_at
+        account.use_count = max(0, account.use_count) + 1
+
+        history = list(self.vault.get_config(CFG_USAGE_HISTORY, []) or [])
+        history.append({
+            "account_id": account.id,
+            "riot_id": riot_id or f"{account.game_name}#{account.tag_line}",
+            "used_at": used_at,
+        })
+        self.vault.config[CFG_USAGE_HISTORY] = history[-USAGE_HISTORY_LIMIT:]
+        try:
+            self.vault.update(account)
+        except Exception:
+            log.exception("could not save account usage history")
+            return
+        self._refresh_grid()
+
     def _on_switch_failed(self, msg: str) -> None:
         log.info("switch failed: %s", msg)
+        self._active_switch_account_id = None
         self._switch_cancel_requested = True
         if self._switch_dialog is not None:
             self._switch_dialog.close()
@@ -692,6 +889,7 @@ class MainWindow(QMainWindow):
 
     def _on_switch_cancelled(self) -> None:
         log.info("switch cancelled by user")
+        self._active_switch_account_id = None
         self._switch_cancel_requested = True
         if self._switch_dialog is not None:
             self._switch_dialog.close()

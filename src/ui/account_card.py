@@ -3,8 +3,7 @@
 # One card per account. The card is what the user double-clicks to switch.
 # Layout:
 #   +------------------------------------------+
-#   |              [✏️] [🗑️]                  | <- hover icons (hidden until mouse enters)
-#   | [👤]  Faker#KR1                          | <- profile icon (40px) + Riot ID
+#   | [👤]  Faker#KR1                     [♥] | <- profile icon + favorite
 #   |       KR                                 |
 #   |       main ranked account                | <- optional note (italic; hidden if empty)
 #   |                                          | (stretch)
@@ -39,9 +38,8 @@ from src.ui.rank_icon import rank_pixmap
 
 # Tweakable card geometry.
 CARD_WIDTH = 240
-CARD_HEIGHT = 180         # extra room for the two-row rank block
+CARD_HEIGHT = 216         # room for tags, usage, and the two-row rank block
 HOVER_ICON_SIZE = 26
-HOVER_ICON_MARGIN = 6     # distance from the top-right corner
 RANK_ICON_SIZE = 22       # smaller — sits inline with the rank text
 RANK_LABEL_WIDTH = 32     # fixed width for "Solo" / "Flex" label so the
                           # text columns line up between the two rows
@@ -70,8 +68,7 @@ def _transparent_for_mouse(w) -> None:
     # through to the parent AccountCard. Without this, the right-click
     # context menu and the double-click-to-switch wouldn't fire when the
     # cursor was over any label or row widget. Keep this OFF on real
-    # interactive children (the hover ✏️ / 🗑️ buttons) — they still
-    # need their own clicks.
+    # interactive children such as the favorite button.
     w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
 
@@ -81,6 +78,7 @@ class AccountCard(QFrame):
     edit_requested = pyqtSignal(str)
     delete_requested = pyqtSignal(str)
     refresh_requested = pyqtSignal(str)
+    favorite_requested = pyqtSignal(str)
     # Emitted on menu: (account_id, direction) where direction is "up" or "down"
     move_requested = pyqtSignal(str, str)
     # Emitted when a reorder drag crosses the movement threshold:
@@ -90,9 +88,10 @@ class AccountCard(QFrame):
     # Emitted after a left-button drag finishes: (account_id, global_drop_pos).
     drag_reorder_requested = pyqtSignal(str, QPoint)
 
-    def __init__(self, account: Account, parent=None):
+    def __init__(self, account: Account, parent=None, allow_reorder: bool = True):
         super().__init__(parent)
         self.account = account
+        self.allow_reorder = allow_reorder
         self._press_pos = QPoint()
         self._dragging_for_reorder = False
 
@@ -105,7 +104,7 @@ class AccountCard(QFrame):
         self.setStyleSheet(_STYLE_DEFAULT)
 
         self._build_ui()
-        self._build_hover_icons()
+        self._apply_favorite_style()
 
     # ---------- layout ----------
 
@@ -172,7 +171,31 @@ class AccountCard(QFrame):
         # line, not the vertical centre of the (variable-height) text stack.
         top_row.addWidget(self.profile_icon_label, 0, Qt.AlignmentFlag.AlignTop)
         top_row.addLayout(text_stack, 1)
+        self.favorite_btn = QPushButton()
+        self.favorite_btn.setFixedSize(HOVER_ICON_SIZE, HOVER_ICON_SIZE)
+        self.favorite_btn.setCursor(Qt.CursorShape.ArrowCursor)
+        self.favorite_btn.clicked.connect(
+            lambda: self.favorite_requested.emit(self.account.id)
+        )
+        top_row.addWidget(
+            self.favorite_btn,
+            0,
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight,
+        )
         layout.addLayout(top_row)
+
+        self.tags_label = QLabel("")
+        self.tags_label.setStyleSheet("color: #76a9d6; font-size: 10px;")
+        self.tags_label.setWordWrap(False)
+        _transparent_for_mouse(self.tags_label)
+        layout.addWidget(self.tags_label)
+        self._apply_tags()
+
+        self.usage_label = QLabel("")
+        self.usage_label.setStyleSheet("color: #777; font-size: 10px;")
+        _transparent_for_mouse(self.usage_label)
+        layout.addWidget(self.usage_label)
+        self._apply_usage()
 
         layout.addStretch(1)
 
@@ -235,48 +258,6 @@ class AccountCard(QFrame):
 
         return row, icon, text
 
-    def _build_hover_icons(self) -> None:
-        # Two children of `self` floating in the top-right. They consume
-        # click/drag events so the card's body handlers don't fire when the
-        # user clicks an icon. Hidden by default; enterEvent/leaveEvent
-        # toggle visibility together.
-        # Layout from left to right: edit, delete.
-        self.edit_btn = QPushButton("✏️", self)
-        self.edit_btn.setFixedSize(HOVER_ICON_SIZE, HOVER_ICON_SIZE)
-        self.edit_btn.setCursor(Qt.CursorShape.ArrowCursor)
-        self.edit_btn.setToolTip("Edit account")
-        self.edit_btn.setStyleSheet(
-            "QPushButton { background: rgba(0,0,0,120); color: white; "
-            "border: 1px solid #555; border-radius: 4px; }"
-            "QPushButton:hover { background: rgba(80,80,80,180); }"
-        )
-        self.edit_btn.clicked.connect(
-            lambda: self.edit_requested.emit(self.account.id)
-        )
-
-        self.delete_btn = QPushButton("🗑️", self)
-        self.delete_btn.setFixedSize(HOVER_ICON_SIZE, HOVER_ICON_SIZE)
-        self.delete_btn.setCursor(Qt.CursorShape.ArrowCursor)
-        self.delete_btn.setToolTip("Delete account")
-        self.delete_btn.setStyleSheet(self.edit_btn.styleSheet())
-        self.delete_btn.clicked.connect(
-            lambda: self.delete_requested.emit(self.account.id)
-        )
-
-        # Place icons in the top-right corner.
-        # Right-to-left: delete, edit — that puts the destructive
-        # action in the corner where misclicks are least likely.
-        self.delete_btn.move(
-            CARD_WIDTH - HOVER_ICON_SIZE - HOVER_ICON_MARGIN,
-            HOVER_ICON_MARGIN,
-        )
-        self.edit_btn.move(
-            CARD_WIDTH - 2 * HOVER_ICON_SIZE - 2 * HOVER_ICON_MARGIN,
-            HOVER_ICON_MARGIN,
-        )
-        self.edit_btn.hide()
-        self.delete_btn.hide()
-
     # ---------- formatters (kept simple so Phase 3 can swap them out) ----------
 
     def _format_riot_id(self) -> str:
@@ -298,7 +279,7 @@ class AccountCard(QFrame):
         # Truncate long notes so they don't blow out the card width. The full
         # text stays available as a tooltip on the WHOLE card (because the
         # note_label is transparent-for-mouse-events and can't catch hovers
-        # itself — see _transparent_for_mouse comment above).
+    # itself — see _transparent_for_mouse comment above).
         text = (self.account.note or "").strip()
         if not text:
             self.note_label.setVisible(False)
@@ -311,6 +292,57 @@ class AccountCard(QFrame):
         self.note_label.setText(display)
         self.setToolTip(text)
         self.note_label.setVisible(True)
+
+    def _apply_tags(self) -> None:
+        tags = [tag.strip() for tag in self.account.tags if tag.strip()]
+        if not tags:
+            self.tags_label.setText("")
+            self.tags_label.setVisible(False)
+            return
+        text = "  ".join(f"#{tag}" for tag in tags)
+        display = text if len(text) <= 38 else (text[:37] + "...")
+        self.tags_label.setText(display)
+        self.tags_label.setVisible(True)
+
+    def _apply_usage(self) -> None:
+        if self.account.last_used_at is None:
+            self.usage_label.setText("Never used")
+            return
+        age = max(0, time.time() - self.account.last_used_at)
+        if age < 60:
+            used = "just now"
+        elif age < 3600:
+            used = f"{int(age // 60)}m ago"
+        elif age < 86400:
+            used = f"{int(age // 3600)}h ago"
+        else:
+            used = f"{int(age // 86400)}d ago"
+        count = max(0, self.account.use_count)
+        suffix = "switch" if count == 1 else "switches"
+        self.usage_label.setText(f"Used {used} | {count} {suffix}")
+
+    def _apply_favorite_style(self) -> None:
+        if self.account.favorite:
+            self.setStyleSheet(
+                "AccountCard { background: #2b2b2b; border: 2px solid #b99535; "
+                "border-radius: 8px; }"
+                "AccountCard:hover { border: 2px solid #e0bd55; }"
+            )
+            self.favorite_btn.setText("\u2665")
+            self.favorite_btn.setToolTip("Remove from favorites")
+            heart_color = "#e05268"
+        else:
+            self.setStyleSheet(_STYLE_DEFAULT)
+            self.favorite_btn.setText("\u2661")
+            self.favorite_btn.setToolTip("Add to favorites")
+            heart_color = "#aaa"
+        self.favorite_btn.setStyleSheet(
+            "QPushButton { background: rgba(0,0,0,120); "
+            f"color: {heart_color}; font-size: 18px; border: 1px solid #555; "
+            "border-radius: 4px; }"
+            "QPushButton:hover { background: rgba(80,80,80,180); color: #ff7088; }"
+        )
+        self.riot_id_label.setText(self._format_riot_id())
 
     @staticmethod
     def _format_one_rank(tier, division, lp) -> str:
@@ -399,24 +431,16 @@ class AccountCard(QFrame):
         # Called when MainWindow re-renders after an edit or rank refresh.
         # Cheaper than tearing down and rebuilding the widget.
         self.account = account
-        self.riot_id_label.setText(self._format_riot_id())
         self.region_label.setText(account.region.upper())
         self._apply_profile_icon()
         self._apply_note()
+        self._apply_tags()
+        self._apply_usage()
+        self._apply_favorite_style()
         self._apply_rank_block()
         self._refresh_stale_label()
 
     # ---------- event handlers ----------
-
-    def enterEvent(self, event):  # type: ignore[override]
-        self.edit_btn.show()
-        self.delete_btn.show()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):  # type: ignore[override]
-        self.edit_btn.hide()
-        self.delete_btn.hide()
-        super().leaveEvent(event)
 
     # ---- mouse handlers ----
     # Right-click shows context menu; double-click switches to account.
@@ -433,6 +457,9 @@ class AccountCard(QFrame):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):  # type: ignore[override]
+        if not self.allow_reorder:
+            super().mouseMoveEvent(event)
+            return
         if not event.buttons() & Qt.MouseButton.LeftButton:
             super().mouseMoveEvent(event)
             return
@@ -507,10 +534,21 @@ class AccountCard(QFrame):
 
         menu.addSeparator()
 
+        favorite_text = (
+            "Remove from favorites" if self.account.favorite
+            else "Add to favorites"
+        )
+        favorite_act = QAction(favorite_text, self)
+        favorite_act.triggered.connect(
+            lambda: self.favorite_requested.emit(self.account.id)
+        )
+        menu.addAction(favorite_act)
+
         reorder_act = QAction("Move account", self)
         reorder_act.triggered.connect(
             lambda: self.move_requested.emit(self.account.id, "reorder")
         )
+        reorder_act.setEnabled(self.allow_reorder)
         menu.addAction(reorder_act)
 
         edit_act = QAction("Edit", self)

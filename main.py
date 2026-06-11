@@ -24,6 +24,7 @@ import sys
 
 from pathlib import Path
 
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -49,6 +50,11 @@ from src.version import APP_VERSION
 CFG_RIOT_INSTALL_PATH = "riot_install_path"
 
 log = logging.getLogger(__name__)
+
+
+def _resource_path(relative_path: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative_path
 
 
 def _install_excepthook() -> None:
@@ -190,6 +196,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Riot Account Switcher")
     app.setApplicationVersion(APP_VERSION)
+    app.setWindowIcon(QIcon(str(_resource_path("assets/app_icon.png"))))
 
     vault = acquire_vault(app)
     if vault is None:

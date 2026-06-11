@@ -5,7 +5,7 @@
 # a one-line change with no migration headache.
 
 from dataclasses import dataclass, field, asdict
-from typing import Optional
+from typing import List, Optional
 import uuid
 
 
@@ -29,6 +29,14 @@ class Account:
     # Free-text reminder shown on the card under the region. Helpful when
     # several accounts share similar Riot IDs ("main", "smurf", "ARAM only").
     note: str = ""
+
+    # User-managed organization metadata.
+    favorite: bool = False
+    tags: List[str] = field(default_factory=list)
+
+    # Successful switch usage summary. Detailed history lives in vault config.
+    last_used_at: Optional[float] = None
+    use_count: int = 0
 
     # Cached rank fields — populated by Riot API in Phase 3.
     # The unprefixed fields are solo-queue (RANKED_SOLO_5x5); the flex_*

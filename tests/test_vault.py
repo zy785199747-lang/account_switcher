@@ -99,6 +99,39 @@ def test_add_and_persist(tmp_path):
     assert v2.accounts[0].game_name == "Alice"
 
 
+def test_account_organization_metadata_round_trip(tmp_path):
+    path = tmp_path / "vault.enc"
+    v = Vault.create(path, "hunter2")
+    account = _make_account()
+    account.favorite = True
+    account.tags = ["main", "jungle"]
+    account.last_used_at = 1_717_171_717.0
+    account.use_count = 12
+    v.add(account)
+
+    saved = Vault.unlock(path, "hunter2").accounts[0]
+    assert saved.favorite is True
+    assert saved.tags == ["main", "jungle"]
+    assert saved.last_used_at == 1_717_171_717.0
+    assert saved.use_count == 12
+
+
+def test_old_account_dict_gets_organization_defaults():
+    account = Account.from_dict({
+        "id": "old-account",
+        "username": "alice",
+        "password": "secret",
+        "game_name": "Alice",
+        "tag_line": "NA1",
+        "region": "na1",
+    })
+
+    assert account.favorite is False
+    assert account.tags == []
+    assert account.last_used_at is None
+    assert account.use_count == 0
+
+
 def test_update_account(tmp_path):
     path = tmp_path / "vault.enc"
     v = Vault.create(path, "hunter2")
